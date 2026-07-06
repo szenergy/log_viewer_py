@@ -86,7 +86,6 @@ class TdmsBrowserWindow(QMainWindow):
         self.tree.setHeaderLabels(["TDMS Structure", "Min", "Max"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.tree.itemSelectionChanged.connect(self.sync_selection_hint)
 
         self.plot_widget = pg.GraphicsLayoutWidget()
         self.plot_widget.setBackground("w")
@@ -159,7 +158,6 @@ class TdmsBrowserWindow(QMainWindow):
         right_layout.addWidget(self.plot_widget, 4)
         right_layout.addWidget(selection_box, 2)
         right_layout.addWidget(filter_box, 1)
-        right_layout.addWidget(self.placeholder_label, 1)
 
         tree_panel = QWidget()
         tree_layout = QVBoxLayout(tree_panel)
@@ -206,11 +204,10 @@ class TdmsBrowserWindow(QMainWindow):
 
         self.loaded_file = LoadedTdmsFile(path=file_path, tdms_file=tdms_file, structure=structure)
         self.file_label.setText(file_path)
-        self.statusBar().showMessage(f"Loaded {os.path.basename(file_path)}")
         self.populate_tree(structure)
         self.clear_assignments()
         self.clear_filter()
-        self.sync_selection_hint()
+        self.statusBar().showMessage(f"Loaded {os.path.basename(file_path)}")
 
     def populate_tree(self, structure: Dict[str, Any]) -> None:
         """Fill the tree view with TDMS file content."""
@@ -238,19 +235,6 @@ class TdmsBrowserWindow(QMainWindow):
             group_item.setExpanded(True)
 
         self.tree.expandToDepth(1)
-
-    def sync_selection_hint(self) -> None:
-        """Keep the placeholder text aligned with the current selection state."""
-        selected = self._selected_channel_refs()
-        if not selected:
-            self.placeholder_label.setText(
-                "Select one or more channels in the tree and assign them to the left or right axis."
-            )
-            return
-
-        self.placeholder_label.setText(
-            f"{len(selected)} channel(s) selected in the tree. Use the assignment buttons to plot them."
-        )
 
     def _selected_channel_refs(self) -> list[tuple[str, str]]:
         """Return the selected channel references from the tree."""
@@ -288,6 +272,9 @@ class TdmsBrowserWindow(QMainWindow):
         self._refresh_series_list("left")
         self._refresh_series_list("right")
         self.update_plot()
+        
+        axis_name = "left" if axis == "left" else "right"
+        self.statusBar().showMessage(f"Added {len(selected)} channel(s) to {axis_name} axis")
 
     def _refresh_series_list(self, axis: str) -> None:
         target_series = self.left_axis_series if axis == "left" else self.right_axis_series
@@ -309,6 +296,7 @@ class TdmsBrowserWindow(QMainWindow):
         if not rows:
             return
 
+        num_removed = len(rows)
         for row in rows:
             if 0 <= row < len(target_series):
                 del target_series[row]
@@ -317,6 +305,9 @@ class TdmsBrowserWindow(QMainWindow):
         self._refresh_series_list("right")
         self._refresh_series_list(axis)
         self.update_plot()
+        
+        axis_name = "left" if axis == "left" else "right"
+        self.statusBar().showMessage(f"Removed {num_removed} channel(s) from {axis_name} axis")
 
     def clear_assignments(self) -> None:
         """Clear both axis assignments and reset the plot."""
@@ -325,6 +316,7 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_series_list.clear()
         self.right_series_list.clear()
         self.update_plot()
+        self.statusBar().showMessage("Plot cleared")
 
     def use_selected_as_filter(self) -> None:
         """Set the selected channel as the filter channel."""
@@ -339,6 +331,7 @@ class TdmsBrowserWindow(QMainWindow):
         self.filter_channel = selected[0]
         group_name, channel_name = self.filter_channel
         self.filter_channel_label.setText(f"Filter Channel: {group_name} / {channel_name}")
+        self.statusBar().showMessage(f"Filter channel set to {group_name} / {channel_name}")
 
     def apply_filter(self) -> None:
         """Apply the filter with the current channel and value."""
