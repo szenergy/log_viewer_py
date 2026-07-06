@@ -9,7 +9,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.converter import convert_tdms_to_excel
-from src.gui.app import run_gui
+from src.gui.multi_source_app import run_gui
 
 
 def main():
