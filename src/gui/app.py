@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -64,6 +66,10 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_axis_series: list[tuple[str, str]] = []
         self.right_axis_series: list[tuple[str, str]] = []
 
+        # Filter state
+        self.filter_channel: Optional[tuple[str, str]] = None
+        self.filter_value: Optional[float] = None
+
         self.open_button = QPushButton("Open TDMS File")
         self.open_button.clicked.connect(self.open_file_dialog)
 
@@ -113,6 +119,17 @@ class TdmsBrowserWindow(QMainWindow):
         self.clear_plot_button = QPushButton("Clear Plot")
         self.clear_plot_button.clicked.connect(self.clear_assignments)
 
+        # Filter UI elements
+        self.use_as_filter_button = QPushButton("Use as Filter")
+        self.use_as_filter_button.clicked.connect(self.use_selected_as_filter)
+        self.filter_channel_label = QLabel("Filter Channel: None")
+        self.filter_value_input = QLineEdit()
+        self.filter_value_input.setPlaceholderText("Enter filter value")
+        self.apply_filter_button = QPushButton("Apply Filter")
+        self.apply_filter_button.clicked.connect(self.apply_filter)
+        self.clear_filter_button = QPushButton("Clear Filter")
+        self.clear_filter_button.clicked.connect(self.clear_filter)
+
         selection_box = QGroupBox("Channel Assignment")
         selection_layout = QGridLayout(selection_box)
         selection_layout.addWidget(QLabel("Selected channels in tree can be assigned to either axis."), 0, 0, 1, 2)
@@ -128,10 +145,20 @@ class TdmsBrowserWindow(QMainWindow):
         self.placeholder_label.setAlignment(Qt.AlignCenter)
         self.placeholder_label.setWordWrap(True)
 
+        # Filter settings panel
+        filter_box = QGroupBox("Data Filter")
+        filter_layout = QGridLayout(filter_box)
+        filter_layout.addWidget(self.filter_channel_label, 0, 0, 1, 2)
+        filter_layout.addWidget(self.apply_filter_button, 0, 2, 1, 1)
+        filter_layout.addWidget(QLabel("Filter Value:"), 1, 0)
+        filter_layout.addWidget(self.filter_value_input, 1, 1)
+        filter_layout.addWidget(self.clear_filter_button, 1, 2, 1, 1)
+
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self.plot_widget, 4)
         right_layout.addWidget(selection_box, 2)
+        right_layout.addWidget(filter_box, 1)
         right_layout.addWidget(self.placeholder_label, 1)
 
         tree_panel = QWidget()
@@ -139,6 +166,7 @@ class TdmsBrowserWindow(QMainWindow):
         tree_layout.addWidget(self.tree, 1)
         tree_layout.addWidget(self.assign_left_button)
         tree_layout.addWidget(self.assign_right_button)
+        tree_layout.addWidget(self.use_as_filter_button)
 
         splitter = QSplitter()
         splitter.addWidget(tree_panel)
@@ -181,6 +209,7 @@ class TdmsBrowserWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded {os.path.basename(file_path)}")
         self.populate_tree(structure)
         self.clear_assignments()
+        self.clear_filter()
         self.sync_selection_hint()
 
     def populate_tree(self, structure: Dict[str, Any]) -> None:
@@ -297,6 +326,44 @@ class TdmsBrowserWindow(QMainWindow):
         self.right_series_list.clear()
         self.update_plot()
 
+    def use_selected_as_filter(self) -> None:
+        """Set the selected channel as the filter channel."""
+        selected = self._selected_channel_refs()
+        if not selected:
+            QMessageBox.warning(self, "No Selection", "Please select a channel to use as filter.")
+            return
+        if len(selected) > 1:
+            QMessageBox.warning(self, "Multiple Selection", "Please select only one channel to use as filter.")
+            return
+
+        self.filter_channel = selected[0]
+        group_name, channel_name = self.filter_channel
+        self.filter_channel_label.setText(f"Filter Channel: {group_name} / {channel_name}")
+
+    def apply_filter(self) -> None:
+        """Apply the filter with the current channel and value."""
+        if self.filter_channel is None:
+            QMessageBox.warning(self, "No Filter Channel", "Please select a channel to use as filter.")
+            return
+
+        try:
+            self.filter_value = float(self.filter_value_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Value", "Please enter a valid numeric value for the filter.")
+            return
+
+        self.statusBar().showMessage(f"Filter applied: {self.filter_channel[0]}/{self.filter_channel[1]} == {self.filter_value}")
+        self.update_plot()
+
+    def clear_filter(self) -> None:
+        """Clear the current filter."""
+        self.filter_channel = None
+        self.filter_value = None
+        self.filter_channel_label.setText("Filter Channel: None")
+        self.filter_value_input.clear()
+        self.statusBar().showMessage("Filter cleared")
+        self.update_plot()
+
     def update_plot(self) -> None:
         """Render the currently assigned channels on a shared plot with two Y axes."""
         self.plot_item.clear()
@@ -355,13 +422,29 @@ class TdmsBrowserWindow(QMainWindow):
         return self.series_palette[index % len(self.series_palette)]
 
     def _get_channel_data(self, tdms_file: Any, group_name: str, channel_name: str) -> Optional[tuple[Any, Any]]:
-        """Return x and y arrays for the selected channel."""
+        """Return x and y arrays for the selected channel, applying filter if set."""
         try:
             channel = tdms_file[group_name][channel_name]
             y_values = channel.data
             if y_values is None:
                 return None
-            x_values = range(len(y_values))
+            
+            x_values = np.arange(len(y_values))
+            
+            # Apply filter if one is set
+            if self.filter_channel is not None and self.filter_value is not None:
+                filter_group, filter_channel = self.filter_channel
+                try:
+                    filter_data = tdms_file[filter_group][filter_channel].data
+                    if filter_data is not None:
+                        # Find indices where filter_data matches filter_value
+                        mask = np.isclose(filter_data, self.filter_value)
+                        x_values = x_values[mask]
+                        y_values = y_values[mask]
+                except Exception:
+                    # If filter data can't be retrieved, just return unfiltered data
+                    pass
+            
             return x_values, y_values
         except Exception:
             return None

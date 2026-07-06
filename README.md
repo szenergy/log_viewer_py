@@ -1,6 +1,6 @@
-# TDMS to Excel Converter
+# TDMS viewer and converter
 
-This repository contains a small Python utility that converts TDMS files into Excel workbooks.
+This repository contains a small Python utility that can convert TDMS files into Excel sheets and also view and plot TDMS data.
 
 ## Current State
 
@@ -9,9 +9,7 @@ This repository contains a small Python utility that converts TDMS files into Ex
 - Implemented: writing each TDMS group to its own Excel sheet (one sheet per group).
 - Implemented: column headers using channel names.
 - Implemented: verbose progress indicators for extraction and write phases.
-- Implemented: Qt GUI shell for browsing TDMS file structure.
-
-The implementation is minimal and focused on the basic feature set (MVP).
+- Implemented: Qt GUI shell for browsing and plotting TDMS data.
 
 ## Files of interest
 
