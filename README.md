@@ -1,34 +1,65 @@
-# TDMS viewer and converter
+# TDMS Graph Explorer
 
-This repository contains a small Python utility that can convert TDMS files into Excel sheets and also view and plot TDMS data.
+TDMS Graph Explorer is a desktop tool for working with TDMS test data.
 
-## Current State
+## Features
 
-- Implemented: reading TDMS files with `nptdms`.
-- Implemented: extracting all groups and channels.
-- Implemented: writing each TDMS group to its own Excel sheet (one sheet per group).
-- Implemented: column headers using channel names.
-- Implemented: verbose progress indicators for extraction and write phases.
-- Implemented: Qt GUI shell for browsing and plotting TDMS data.
+- TDMS file browser with group/channel tree and channel min/max preview
+- Multi-channel plotting with separate left/right axis assignment
+- Series management (add/remove/clear plotted channels)
+- Value-based data filter:
+  - choose one channel as filter source,
+  - set a numeric value,
+  - plot only samples where filter channel equals that value
+- Status bar messages for user actions
+- CLI conversion of TDMS to Excel (one sheet per TDMS group)
 
-## Files of interest
+## Requirements
 
-- [src/tdms_reader.py](src/tdms_reader.py) — TDMS reading and data extraction
-- [src/excel_writer.py](src/excel_writer.py) — Excel workbook creation and writing
-- [src/converter.py](src/converter.py) — Conversion orchestration and progress
-- [main.py](main.py) — CLI entry point
+- Python 3.10+
+- Linux/Windows/macOS
 
-## Dependencies
-
-Use a Python virtual environment and install dependencies from:
+Install dependencies:
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate.fish   # or `.venv/bin/activate` for bash/zsh
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Usage
+## Run The App
+
+Start the GUI:
+
+```bash
+python main.py --gui
+```
+
+Start GUI and open a file immediately:
+
+```bash
+python main.py --gui test_data/Test_17_06_2026_05_46_54.tdms
+```
+
+## How To Use (GUI)
+
+1. Click Open TDMS File and select your .tdms file.
+2. In the left tree, select one or more channels.
+3. Click Add Selected To Left or Add Selected To Right.
+4. Remove channels with Remove From Left/Right, or reset with Clear Plot.
+
+### Apply a filter
+
+1. In the tree, select exactly one channel to use as the filter channel.
+2. Click Use as Filter.
+3. In Data Filter, enter a numeric value.
+4. Click Apply Filter.
+
+Only samples where the selected filter channel equals the entered value are plotted.
+
+To remove filtering, click Clear Filter.
+
+## Convert TDMS To Excel (CLI)
 
 Basic conversion:
 
@@ -36,22 +67,16 @@ Basic conversion:
 python main.py test_data/Test_17_06_2026_05_46_54.tdms
 ```
 
-Verbose mode (shows progress bars):
+Set output path:
 
-```bash y
+```bash
+python main.py test_data/Test_17_06_2026_05_46_54.tdms -o output/converted.xlsx
+```
+
+Verbose conversion output:
+
+```bash
 python main.py test_data/Test_17_06_2026_05_46_54.tdms -v
 ```
 
-Launch the Qt GUI browser:
-
-```bash
-python main.py --gui
-```
-
-You can also preload a file in the GUI:
-
-```bash
-python main.py --gui test_data/Test_17_06_2026_05_46_54.tdms
-```
-
-By default the output Excel file is written to the `output/` directory with the same base filename.
+If -o is not provided, the output file is created under output/ with the TDMS base filename.
