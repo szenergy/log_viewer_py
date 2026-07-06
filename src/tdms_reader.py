@@ -119,3 +119,54 @@ def get_file_metadata(tdms_file: TdmsFile) -> Dict[str, Any]:
         }
     
     return metadata
+
+
+def _safe_properties(properties: Any) -> Dict[str, Any]:
+    """Convert a TDMS properties object to a regular dictionary."""
+    if properties is None:
+        return {}
+
+    try:
+        return dict(properties)
+    except Exception:
+        return {}
+
+
+def get_tdms_structure(tdms_file: TdmsFile) -> Dict[str, Any]:
+    """Return a GUI-friendly summary of the file, groups, channels, and properties."""
+    structure: Dict[str, Any] = {
+        'file_properties': _safe_properties(getattr(tdms_file, 'properties', None)),
+        'groups': [],
+    }
+
+    for group in tdms_file.groups():
+        group_entry: Dict[str, Any] = {
+            'name': group.name,
+            'properties': _safe_properties(getattr(group, 'properties', None)),
+            'channels': [],
+        }
+
+        for channel in group.channels():
+            data = getattr(channel, 'data', None)
+            if data is None or len(data) == 0:
+                min_value = None
+                max_value = None
+            else:
+                try:
+                    min_value = data.min()
+                    max_value = data.max()
+                except Exception:
+                    min_value = None
+                    max_value = None
+
+            group_entry['channels'].append({
+                'name': channel.name,
+                'properties': _safe_properties(getattr(channel, 'properties', None)),
+                'length': len(channel.data) if getattr(channel, 'data', None) is not None else 0,
+                'min': min_value,
+                'max': max_value,
+            })
+
+        structure['groups'].append(group_entry)
+
+    return structure
