@@ -35,7 +35,7 @@ class SeriesRef:
 
 
 def load_data_source(filepath: str) -> LoadedSource:
-    """Load a TDMS or CSV file into a normalized source object."""
+    """Load a TDMS, CSV, or Excel file into a normalized source object."""
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"File not found: {filepath}")
 
@@ -67,7 +67,67 @@ def load_data_source(filepath: str) -> LoadedSource:
             structure=structure,
         )
 
+    if extension in (".xlsx", ".xls"):
+        sheets_dict = pd.read_excel(filepath, sheet_name=None)
+        structure = _build_xlsx_structure(filepath, sheets_dict)
+        return LoadedSource(
+            source_id=source_id,
+            path=filepath,
+            kind="xlsx",
+            display_name=display_name,
+            payload=sheets_dict,
+            structure=structure,
+        )
+
     raise ValueError(f"Unsupported file type: {filepath}")
+
+
+def _build_xlsx_structure(filepath: str, sheets_dict: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """Create a GUI-friendly summary for XLSX/XLS files."""
+    groups = []
+
+    for sheet_name, frame in sheets_dict.items():
+        group_name = str(sheet_name)
+        group_entry: Dict[str, Any] = {
+            "name": group_name,
+            "properties": {
+                "source_type": "xlsx",
+                "rows": int(frame.shape[0]),
+                "columns": [str(c) for c in frame.columns],
+            },
+            "channels": [],
+        }
+
+        for column_name in frame.columns:
+            col_str = str(column_name)
+            numeric_values = pd.to_numeric(frame[column_name], errors="coerce")
+            valid_values = numeric_values.dropna()
+            if valid_values.empty:
+                min_value = None
+                max_value = None
+            else:
+                min_value = float(valid_values.min())
+                max_value = float(valid_values.max())
+
+            group_entry["channels"].append(
+                {
+                    "name": col_str,
+                    "properties": {},
+                    "length": int(len(frame[column_name])),
+                    "min": min_value,
+                    "max": max_value,
+                }
+            )
+        groups.append(group_entry)
+
+    return {
+        "file_properties": {
+            "source_type": "xlsx",
+            "sheets": [str(s) for s in sheets_dict.keys()],
+        },
+        "groups": groups,
+    }
+
 
 
 def _build_csv_structure(filepath: str, frame: pd.DataFrame) -> Dict[str, Any]:
@@ -144,6 +204,36 @@ def get_channel_data(source: LoadedSource, group_name: str, channel_name: str) -
         except Exception:
             return None
 
+    if source.kind == "xlsx":
+        try:
+            df = source.payload.get(group_name)
+            if df is None:
+                for k, v in source.payload.items():
+                    if str(k) == group_name:
+                        df = v
+                        break
+            if df is None:
+                return None
+
+            col_key = None
+            for col in df.columns:
+                if str(col) == channel_name:
+                    col_key = col
+                    break
+            if col_key is None:
+                return None
+
+            series = pd.to_numeric(df[col_key], errors="coerce")
+            values = series.to_numpy(dtype=float)
+            mask = np.isfinite(values)
+            if not np.any(mask):
+                return None
+            x_values = np.arange(len(values))[mask]
+            y_values = values[mask]
+            return x_values, y_values
+        except Exception:
+            return None
+
     return None
 
 
@@ -161,6 +251,33 @@ def get_filter_mask(source: LoadedSource, group_name: str, channel_name: str, fi
     if source.kind == "csv":
         try:
             series = pd.to_numeric(source.payload[channel_name], errors="coerce")
+            values = series.to_numpy(dtype=float)
+            if values.size == 0:
+                return None
+            return np.isclose(values, filter_value)
+        except Exception:
+            return None
+
+    if source.kind == "xlsx":
+        try:
+            df = source.payload.get(group_name)
+            if df is None:
+                for k, v in source.payload.items():
+                    if str(k) == group_name:
+                        df = v
+                        break
+            if df is None:
+                return None
+
+            col_key = None
+            for col in df.columns:
+                if str(col) == channel_name:
+                    col_key = col
+                    break
+            if col_key is None:
+                return None
+
+            series = pd.to_numeric(df[col_key], errors="coerce")
             values = series.to_numpy(dtype=float)
             if values.size == 0:
                 return None

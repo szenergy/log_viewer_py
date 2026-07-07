@@ -7,7 +7,7 @@ import sys
 from typing import Any, Dict, Optional
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QSplitter,
     QStatusBar,
     QTreeWidget,
@@ -34,6 +35,35 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 from src.data_sources import LoadedSource, SeriesRef, get_channel_data, get_filter_mask, get_source_label, load_data_source
+
+
+class FileLoaderThread(QThread):
+    """Background worker thread to load files without blocking the GUI."""
+    file_loaded = Signal(object)
+    finished_loading = Signal()
+
+    def __init__(self, file_paths: list[str], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.file_paths = file_paths
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
+
+    def run(self) -> None:
+        for path in self.file_paths:
+            if self._is_cancelled:
+                break
+            try:
+                source = load_data_source(path)
+                if self._is_cancelled:
+                    break
+                self.file_loaded.emit(source)
+            except Exception as exc:
+                if self._is_cancelled:
+                    break
+                self.file_loaded.emit((path, str(exc)))
+        self.finished_loading.emit()
 
 
 class TdmsBrowserWindow(QMainWindow):
@@ -60,6 +90,19 @@ class TdmsBrowserWindow(QMainWindow):
 
         self.filter_channel: Optional[SeriesRef] = None
         self.filter_value: Optional[float] = None
+        self.plotted_data_cache = []
+        self.cursor_items = []
+        self.cursor_items_right = []
+
+        # Cursor widgets & line
+        self.cursor_label = QLabel("Hover over the plot to inspect values")
+        self.cursor_label.setWordWrap(True)
+        self.cursor_label.setStyleSheet(
+            "QLabel { background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; padding: 8px; font-family: monospace; font-size: 11px; }"
+        )
+
+        self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#777777", width=1.5, style=Qt.DashLine))
+        self.v_line.hide()
 
         self.open_button = QPushButton("Load Files")
         self.open_button.clicked.connect(self.open_file_dialog)
@@ -109,6 +152,10 @@ class TdmsBrowserWindow(QMainWindow):
         self.plot_item.getAxis("right").setLabel("Right axis")
         self.plot_item.vb.sigResized.connect(self._update_right_view)
 
+        # Cursor line addition and interaction
+        self.plot_item.addItem(self.v_line, ignoreBounds=True)
+        self.plot_item.scene().sigMouseMoved.connect(self.mouse_moved)
+
         self.left_series_list = QListWidget()
         self.right_series_list = QListWidget()
         self.left_series_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -155,6 +202,7 @@ class TdmsBrowserWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self.plot_widget, 4)
+        right_layout.addWidget(self.cursor_label)
         right_layout.addWidget(selection_box, 2)
         right_layout.addWidget(filter_box, 1)
 
@@ -183,57 +231,106 @@ class TdmsBrowserWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def open_file_dialog(self) -> None:
-        """Open one or more TDMS/CSV files from disk."""
+        """Open one or more TDMS/CSV/Excel files from disk."""
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Open Files",
             os.getcwd(),
-            "Data Files (*.tdms *.csv);;TDMS Files (*.tdms);;CSV Files (*.csv);;All Files (*)",
+            "Data Files (*.tdms *.csv *.xlsx *.xls);;TDMS Files (*.tdms);;CSV Files (*.csv);;Excel Files (*.xlsx *.xls);;All Files (*)",
         )
         if file_paths:
             self.load_files(file_paths)
 
     def load_files(self, file_paths: list[str]) -> None:
-        """Load multiple files and add them to the source registry."""
+        """Load multiple files asynchronously in a background thread and show a progress dialog."""
         loaded_count = 0
         skipped_count = 0
         errors: list[str] = []
         existing_paths = {os.path.abspath(source.path) for source in self.loaded_sources.values()}
 
+        paths_to_load = []
         for file_path in file_paths:
             absolute_path = os.path.abspath(file_path)
             if absolute_path in existing_paths:
                 skipped_count += 1
                 continue
+            paths_to_load.append(file_path)
 
-            try:
-                source = load_data_source(file_path)
-            except Exception as exc:
-                errors.append(f"{os.path.basename(file_path)}: {exc}")
-                continue
+        if not paths_to_load:
+            if skipped_count:
+                self.statusBar().showMessage("Selected files are already loaded")
+            return
 
-            self.loaded_sources[source.source_id] = source
-            self.source_order.append(source.source_id)
-            existing_paths.add(os.path.abspath(source.path))
-            loaded_count += 1
+        # Setup Progress Dialog
+        self.progress_dialog = QProgressDialog("Initializing loader...", "Cancel", 0, len(paths_to_load), self)
+        self.progress_dialog.setWindowTitle("Loading Files")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setMinimumDuration(0)  # Show immediately
 
-        if loaded_count:
-            self.refresh_loaded_sources_view()
-            self.refresh_tree()
-            self.statusBar().showMessage(f"Loaded {loaded_count} file(s)")
+        if len(paths_to_load) == 1:
+            # Set to busy indicator (marquee animation) if loading a single file
+            self.progress_dialog.setRange(0, 0)
+            self.progress_dialog.setLabelText(f"Loading {os.path.basename(paths_to_load[0])}...")
+        else:
+            self.progress_dialog.setRange(0, len(paths_to_load))
+            self.progress_dialog.setLabelText(f"Loading 0 / {len(paths_to_load)} files...")
 
-        if skipped_count and not loaded_count and not errors:
-            self.statusBar().showMessage("Selected files are already loaded")
+        # Create worker thread
+        self.loader_thread = FileLoaderThread(paths_to_load, self)
+        loaded_results = []
 
-        if errors:
-            QMessageBox.warning(
-                self,
-                "Some Files Could Not Be Loaded",
-                "\n".join(errors),
-            )
+        def handle_file_loaded(result):
+            if isinstance(result, LoadedSource):
+                loaded_results.append(result)
+            else:
+                errors.append(f"{os.path.basename(result[0])}: {result[1]}")
 
-        if loaded_count == 0 and not errors and skipped_count == 0:
-            self.statusBar().showMessage("No files loaded")
+            completed = len(loaded_results) + len(errors)
+            if len(paths_to_load) > 1 and self.progress_dialog:
+                self.progress_dialog.setValue(completed)
+                self.progress_dialog.setLabelText(f"Loading {completed} / {len(paths_to_load)} files...")
+
+        def handle_finished():
+            if self.progress_dialog:
+                self.progress_dialog.close()
+
+            # Process all loaded results
+            nonlocal loaded_count
+            for source in loaded_results:
+                self.loaded_sources[source.source_id] = source
+                self.source_order.append(source.source_id)
+                loaded_count += 1
+
+            if loaded_count:
+                self.refresh_loaded_sources_view()
+                self.refresh_tree()
+                self.statusBar().showMessage(f"Loaded {loaded_count} file(s)")
+
+            if skipped_count and not loaded_count and not errors:
+                self.statusBar().showMessage("Selected files are already loaded")
+
+            if errors:
+                QMessageBox.warning(
+                    self,
+                    "Some Files Could Not Be Loaded",
+                    "\n".join(errors),
+                )
+
+            if loaded_count == 0 and not errors and skipped_count == 0:
+                self.statusBar().showMessage("No files loaded")
+
+            # Clean up references
+            self.loader_thread = None
+            self.progress_dialog = None
+
+        self.progress_dialog.canceled.connect(self.loader_thread.cancel)
+        self.loader_thread.file_loaded.connect(handle_file_loaded)
+        self.loader_thread.finished_loading.connect(handle_finished)
+        self.loader_thread.finished.connect(self.loader_thread.deleteLater)
+
+        # Show the modal loader dialog and run background thread
+        self.progress_dialog.show()
+        self.loader_thread.start()
 
     def unload_selected_sources(self) -> None:
         """Remove the selected loaded files from the app."""
@@ -326,6 +423,10 @@ class TdmsBrowserWindow(QMainWindow):
             source_item.setExpanded(True)
 
         self.tree.expandToDepth(2)
+
+        # Auto-resize columns to fit content
+        for col in range(self.tree.columnCount()):
+            self.tree.resizeColumnToContents(col)
 
     def _selected_channel_refs(self) -> list[SeriesRef]:
         """Return selected channel references from the tree."""
@@ -456,10 +557,27 @@ class TdmsBrowserWindow(QMainWindow):
 
     def update_plot(self) -> None:
         """Render the currently assigned channels on a shared plot with two Y axes."""
+        # Clean up any existing hover dots and texts
+        for item in self.cursor_items:
+            try:
+                self.plot_item.removeItem(item)
+            except Exception:
+                pass
+        self.cursor_items.clear()
+
+        for item in self.cursor_items_right:
+            try:
+                self.right_view_box.removeItem(item)
+            except Exception:
+                pass
+        self.cursor_items_right.clear()
+
         self.plot_item.clear()
         self.right_view_box.clear()
         self.plot_item.setLabel("left", "Left axis")
         self.plot_item.getAxis("right").setLabel("Right axis")
+
+        self.plotted_data_cache = []
 
         left_curves = []
         right_curves = []
@@ -473,6 +591,26 @@ class TdmsBrowserWindow(QMainWindow):
             curve = self.plot_item.plot(x_values, y_values, pen=pg.mkPen(color, width=2))
             left_curves.append(curve)
 
+            # Create interactive cursor indicators
+            dot = pg.ScatterPlotItem(size=8, brush=pg.mkBrush(color), pen=pg.mkPen('w', width=1))
+            dot.hide()
+            text = pg.TextItem(anchor=(-0.15, 0.5), color='k', fill=(255, 255, 255, 200), border=pg.mkPen(color, width=1))
+            text.hide()
+            self.plot_item.addItem(dot)
+            self.plot_item.addItem(text)
+            self.cursor_items.append(dot)
+            self.cursor_items.append(text)
+
+            self.plotted_data_cache.append({
+                "label": self._series_ref_label(ref),
+                "x_values": x_values,
+                "y_values": y_values,
+                "axis": "Left",
+                "color": color,
+                "dot_item": dot,
+                "text_item": text
+            })
+
         for index, ref in enumerate(self.right_axis_series):
             series = self._get_channel_data(ref)
             if series is None:
@@ -483,6 +621,29 @@ class TdmsBrowserWindow(QMainWindow):
             self.right_view_box.addItem(curve)
             right_curves.append(curve)
 
+            # Create interactive cursor indicators (Right Y-axis scale)
+            dot = pg.ScatterPlotItem(size=8, brush=pg.mkBrush(color), pen=pg.mkPen('w', width=1))
+            dot.hide()
+            text = pg.TextItem(anchor=(-0.15, 0.5), color='k', fill=(255, 255, 255, 200), border=pg.mkPen(color, width=1))
+            text.hide()
+            self.right_view_box.addItem(dot)
+            self.right_view_box.addItem(text)
+            self.cursor_items_right.append(dot)
+            self.cursor_items_right.append(text)
+
+            self.plotted_data_cache.append({
+                "label": self._series_ref_label(ref),
+                "x_values": x_values,
+                "y_values": y_values,
+                "axis": "Right",
+                "color": color,
+                "dot_item": dot,
+                "text_item": text
+            })
+
+        # Add the vertical cursor line back on top of the left-axis curves
+        self.plot_item.addItem(self.v_line, ignoreBounds=True)
+
         if right_curves:
             self._update_right_view()
         else:
@@ -490,6 +651,54 @@ class TdmsBrowserWindow(QMainWindow):
 
         if not left_curves and not right_curves:
             self.plot_item.setLabel("left", "Left axis")
+
+    def mouse_moved(self, evt) -> None:
+        """Handle mouse movement to update the vertical cursor line and show values next to data points."""
+        pos = evt
+        if self.plot_item.vb.sceneBoundingRect().contains(pos):
+            mousePoint = self.plot_item.vb.mapSceneToView(pos)
+            x = mousePoint.x()
+
+            # Position the vertical line
+            self.v_line.setValue(x)
+            self.v_line.show()
+
+            for item in getattr(self, "plotted_data_cache", []):
+                x_vals = item["x_values"]
+                y_vals = item["y_values"]
+                dot = item.get("dot_item")
+                text_item = item.get("text_item")
+
+                if x_vals is None or len(x_vals) == 0:
+                    if dot: dot.hide()
+                    if text_item: text_item.hide()
+                    continue
+
+                # Find nearest x index
+                idx = np.argmin(np.abs(x_vals - x))
+                nearest_x = x_vals[idx]
+                nearest_y = y_vals[idx]
+
+                # Update dot position
+                if dot:
+                    dot.setData(x=[nearest_x], y=[nearest_y])
+                    dot.show()
+
+                # Update text position and content
+                if text_item:
+                    text_item.setText(f"{nearest_y:.6g}")
+                    text_item.setPos(nearest_x, nearest_y)
+                    text_item.show()
+
+            self.cursor_label.setText(f"<b>Cursor Position:</b> X = {x:.4g}")
+        else:
+            self.v_line.hide()
+            for item in getattr(self, "plotted_data_cache", []):
+                dot = item.get("dot_item")
+                text_item = item.get("text_item")
+                if dot: dot.hide()
+                if text_item: text_item.hide()
+            self.cursor_label.setText("Hover over the plot to inspect values")
 
     def _get_channel_data(self, series_ref: SeriesRef) -> Optional[tuple[Any, Any]]:
         """Return x and y arrays for the selected channel, applying a filter if needed."""
