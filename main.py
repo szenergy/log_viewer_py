@@ -24,12 +24,6 @@ Examples:
   python main.py test_data/Test_17_06_2026_05_46_54.tdms -o output/converted.xlsx
         """
     )
-
-    parser.add_argument(
-        '--gui',
-        action='store_true',
-        help='Launch the Qt-based TDMS browser instead of converting to Excel'
-    )
     
     parser.add_argument(
         'tdms_file',
