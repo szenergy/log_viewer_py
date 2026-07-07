@@ -30,11 +30,151 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
+    QDialog,
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
 )
 
 import pyqtgraph as pg
 
 from src.data_sources import LoadedSource, SeriesRef, get_channel_data, get_filter_mask, get_source_label, load_data_source
+
+
+class FileConfigDialog(QDialog):
+    """Modal dialog to configure a source's sample rate and X-axis channel."""
+
+    def __init__(self, source: LoadedSource, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Configure Source: {source.display_name}")
+        self.resize(450, 180)
+
+        self.source = source
+
+        layout = QVBoxLayout(self)
+
+        form_layout = QFormLayout()
+
+        # Sample rate
+        self.rate_spin = QDoubleSpinBox()
+        self.rate_spin.setRange(0.00001, 1000000.0)
+        self.rate_spin.setDecimals(5)
+        self.rate_spin.setSingleStep(0.1)
+        self.rate_spin.setSuffix(" s")
+        self.rate_spin.setValue(source.sample_rate)
+        form_layout.addRow("Sample Rate (seconds):", self.rate_spin)
+
+        # X-axis combo box
+        self.x_combo = QComboBox()
+        self.x_combo.addItem("Sample Index (Default)", None)
+
+        # Populate combo box with channels
+        current_x_idx = 0
+        idx = 1
+        for group in source.structure.get("groups", []):
+            group_name = group.get("name", "")
+            for channel in group.get("channels", []):
+                channel_name = channel.get("name", "")
+                display_label = f"[{group_name}] {channel_name}" if source.kind != "csv" else channel_name
+                role_data = (group_name, channel_name)
+
+                self.x_combo.addItem(display_label, role_data)
+
+                # Check X-channel match
+                if source.x_channel == role_data:
+                    current_x_idx = idx
+                idx += 1
+
+        self.x_combo.setCurrentIndex(current_x_idx)
+
+        form_layout.addRow("X-Axis Channel:", self.x_combo)
+
+        layout.addLayout(form_layout)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+    def get_settings(self) -> tuple[float, Optional[tuple[str, str]]]:
+        """Return the configured sample rate and X-axis channel."""
+        return (
+            self.rate_spin.value(),
+            self.x_combo.currentData()
+        )
+
+
+class SeriesConfigDialog(QDialog):
+    """Modal dialog to configure a plotted series' local filter."""
+
+    def __init__(self, series_ref: SeriesRef, source: LoadedSource, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Configure Channel: {series_ref.channel}")
+        self.resize(450, 180)
+
+        self.series_ref = series_ref
+        self.source = source
+
+        layout = QVBoxLayout(self)
+
+        form_layout = QFormLayout()
+
+        # Filter channel combo box
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItem("None (Disabled)", None)
+
+        # Populate with channels from the same source
+        current_f_idx = 0
+        idx = 1
+        for group in source.structure.get("groups", []):
+            group_name = group.get("name", "")
+            for channel in group.get("channels", []):
+                channel_name = channel.get("name", "")
+                display_label = f"[{group_name}] {channel_name}" if source.kind != "csv" else channel_name
+                role_data = (group_name, channel_name)
+
+                self.filter_combo.addItem(display_label, role_data)
+
+                # Check Filter-channel match
+                if series_ref.filter_channel == role_data:
+                    current_f_idx = idx
+                idx += 1
+
+        self.filter_combo.setCurrentIndex(current_f_idx)
+        form_layout.addRow("Filter Channel:", self.filter_combo)
+
+        # Filter value
+        self.filter_val_spin = QDoubleSpinBox()
+        self.filter_val_spin.setRange(-1000000000.0, 1000000000.0)
+        self.filter_val_spin.setDecimals(5)
+        self.filter_val_spin.setSingleStep(1.0)
+        self.filter_val_spin.setValue(series_ref.filter_value)
+        form_layout.addRow("Filter Value:", self.filter_val_spin)
+
+        layout.addLayout(form_layout)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+    def get_settings(self) -> tuple[Optional[tuple[str, str]], float]:
+        """Return the filter channel and filter value."""
+        return (
+            self.filter_combo.currentData(),
+            self.filter_val_spin.value()
+        )
+
 
 
 class FileLoaderThread(QThread):
@@ -88,8 +228,6 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_axis_series: list[SeriesRef] = []
         self.right_axis_series: list[SeriesRef] = []
 
-        self.filter_channel: Optional[SeriesRef] = None
-        self.filter_value: Optional[float] = None
         self.plotted_data_cache = []
         self.cursor_items = []
         self.cursor_items_right = []
@@ -102,6 +240,7 @@ class TdmsBrowserWindow(QMainWindow):
 
         self.loaded_sources_list = QListWidget()
         self.loaded_sources_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.loaded_sources_list.itemDoubleClicked.connect(self.configure_source_by_item)
 
         self.unload_selected_button = QPushButton("Unload Selected")
         self.unload_selected_button.clicked.connect(self.unload_selected_sources)
@@ -145,6 +284,8 @@ class TdmsBrowserWindow(QMainWindow):
         self.right_series_list = QListWidget()
         self.left_series_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.right_series_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.left_series_list.itemDoubleClicked.connect(lambda item: self.configure_series_by_item(item, "left"))
+        self.right_series_list.itemDoubleClicked.connect(lambda item: self.configure_series_by_item(item, "right"))
 
         self.assign_left_button = QPushButton("Add Selected To Left")
         self.assign_left_button.clicked.connect(self.add_selected_to_left)
@@ -154,41 +295,24 @@ class TdmsBrowserWindow(QMainWindow):
         self.remove_left_button.clicked.connect(lambda: self.remove_from_axis("left"))
         self.remove_right_button = QPushButton("Remove From Right")
         self.remove_right_button.clicked.connect(lambda: self.remove_from_axis("right"))
+        self.set_batch_filter_button = QPushButton("Set Filter for Selected")
+        self.set_batch_filter_button.clicked.connect(self.set_filter_for_selected)
         self.clear_plot_button = QPushButton("Clear Plot")
         self.clear_plot_button.clicked.connect(self.clear_assignments)
 
-        self.use_as_filter_button = QPushButton("Use as Filter")
-        self.use_as_filter_button.clicked.connect(self.use_selected_as_filter)
-        self.filter_channel_label = QLabel("Filter Channel: None")
-        self.filter_value_input = QLineEdit()
-        self.filter_value_input.setPlaceholderText("Enter filter value")
-        self.apply_filter_button = QPushButton("Apply Filter")
-        self.apply_filter_button.clicked.connect(self.apply_filter)
-        self.clear_filter_button = QPushButton("Clear Filter")
-        self.clear_filter_button.clicked.connect(self.clear_filter)
-
         selection_box = QGroupBox("Channel Assignment")
         selection_layout = QGridLayout(selection_box)
-        selection_layout.addWidget(QLabel("Selected channels in the tree can be assigned to either axis."), 0, 0, 1, 2)
         selection_layout.addWidget(self.left_series_list, 1, 0)
         selection_layout.addWidget(self.right_series_list, 1, 1)
         selection_layout.addWidget(self.remove_left_button, 2, 0)
         selection_layout.addWidget(self.remove_right_button, 2, 1)
-        selection_layout.addWidget(self.clear_plot_button, 3, 0, 1, 2)
-
-        filter_box = QGroupBox("Data Filter")
-        filter_layout = QGridLayout(filter_box)
-        filter_layout.addWidget(self.filter_channel_label, 0, 0, 1, 2)
-        filter_layout.addWidget(self.apply_filter_button, 0, 2, 1, 1)
-        filter_layout.addWidget(QLabel("Filter Value:"), 1, 0)
-        filter_layout.addWidget(self.filter_value_input, 1, 1)
-        filter_layout.addWidget(self.clear_filter_button, 1, 2, 1, 1)
+        selection_layout.addWidget(self.set_batch_filter_button, 3, 0, 1, 2)
+        selection_layout.addWidget(self.clear_plot_button, 4, 0, 1, 2)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self.plot_widget, 4)
         right_layout.addWidget(selection_box, 2)
-        right_layout.addWidget(filter_box, 1)
 
         tree_panel = QWidget()
         tree_layout = QVBoxLayout(tree_panel)
@@ -196,7 +320,6 @@ class TdmsBrowserWindow(QMainWindow):
         tree_layout.addWidget(self.tree, 1)
         tree_layout.addWidget(self.assign_left_button)
         tree_layout.addWidget(self.assign_right_button)
-        tree_layout.addWidget(self.use_as_filter_button)
 
         splitter = QSplitter()
         splitter.addWidget(tree_panel)
@@ -270,8 +393,9 @@ class TdmsBrowserWindow(QMainWindow):
 
             completed = len(loaded_results) + len(errors)
             if len(paths_to_load) > 1 and self.progress_dialog:
-                self.progress_dialog.setValue(completed)
                 self.progress_dialog.setLabelText(f"Loading {completed} / {len(paths_to_load)} files...")
+                if self.progress_dialog:
+                    self.progress_dialog.setValue(completed)
 
         def handle_finished():
             if self.progress_dialog:
@@ -279,12 +403,22 @@ class TdmsBrowserWindow(QMainWindow):
 
             # Process all loaded results
             nonlocal loaded_count
+            new_sources = []
             for source in loaded_results:
                 self.loaded_sources[source.source_id] = source
                 self.source_order.append(source.source_id)
+                new_sources.append(source)
                 loaded_count += 1
 
             if loaded_count:
+                # Open modal configuration dialog for each newly loaded file
+                for source in new_sources:
+                    dialog = FileConfigDialog(source, self)
+                    if dialog.exec() == QDialog.Accepted:
+                        rate, x_chan = dialog.get_settings()
+                        source.sample_rate = rate
+                        source.x_channel = x_chan
+
                 self.refresh_loaded_sources_view()
                 self.refresh_tree()
                 self.statusBar().showMessage(f"Loaded {loaded_count} file(s)")
@@ -314,6 +448,103 @@ class TdmsBrowserWindow(QMainWindow):
         # Show the modal loader dialog and run background thread
         self.progress_dialog.show()
         self.loader_thread.start()
+
+    def configure_source_by_item(self, item: QListWidgetItem) -> None:
+        """Open the configuration dialog for a loaded file when double-clicked."""
+        source_id = item.data(Qt.UserRole)
+        if not source_id:
+            return
+        source = self.loaded_sources.get(str(source_id))
+        if source is None:
+            return
+
+        dialog = FileConfigDialog(source, self)
+        if dialog.exec() == QDialog.Accepted:
+            rate, x_chan = dialog.get_settings()
+            source.sample_rate = rate
+            source.x_channel = x_chan
+
+            self.refresh_loaded_sources_view()
+            self.refresh_tree()
+            self.update_plot()
+            self.statusBar().showMessage(f"Updated configuration for {source.display_name}")
+
+    def configure_series_by_item(self, item: QListWidgetItem, axis: str) -> None:
+        """Open the configuration dialog for a plotted channel when double-clicked."""
+        target_list = self.left_series_list if axis == "left" else self.right_series_list
+        target_series = self.left_axis_series if axis == "left" else self.right_axis_series
+
+        # Find the index of the clicked item
+        row = target_list.row(item)
+        if not (0 <= row < len(target_series)):
+            return
+
+        ref = target_series[row]
+        source = self.loaded_sources.get(ref.source_id)
+        if source is None:
+            return
+
+        dialog = SeriesConfigDialog(ref, source, self)
+        if dialog.exec() == QDialog.Accepted:
+            f_chan, f_val = dialog.get_settings()
+            ref.filter_channel = f_chan
+            ref.filter_value = f_val
+
+            self._refresh_series_list(axis)
+            self.update_plot()
+            self.statusBar().showMessage(f"Updated filter for plotted channel: {ref.channel}")
+
+    def set_filter_for_selected(self) -> None:
+        """Set the same filter settings for all selected channels in the axis lists (must be from the same file)."""
+        left_sel = self.left_series_list.selectedItems()
+        right_sel = self.right_series_list.selectedItems()
+
+        selected_refs = []
+        for item in left_sel:
+            row = self.left_series_list.row(item)
+            if 0 <= row < len(self.left_axis_series):
+                selected_refs.append(self.left_axis_series[row])
+        for item in right_sel:
+            row = self.right_series_list.row(item)
+            if 0 <= row < len(self.right_axis_series):
+                selected_refs.append(self.right_axis_series[row])
+
+        if not selected_refs:
+            QMessageBox.warning(
+                self,
+                "No Selection",
+                "Please select one or more channels in the axis lists to batch-filter."
+            )
+            return
+
+        # Ensure all selected channels are from the same loaded file
+        source_ids = {ref.source_id for ref in selected_refs}
+        if len(source_ids) > 1:
+            QMessageBox.warning(
+                self,
+                "Multiple Files Selected",
+                "Batch filtering can only be applied to channels from the same file. Please select channels from one file only."
+            )
+            return
+
+        source_id = list(source_ids)[0]
+        source = self.loaded_sources.get(source_id)
+        if source is None:
+            return
+
+        # Open SeriesConfigDialog using the first selected channel's settings as template
+        template_ref = selected_refs[0]
+        dialog = SeriesConfigDialog(template_ref, source, self)
+        if dialog.exec() == QDialog.Accepted:
+            f_chan, f_val = dialog.get_settings()
+            for ref in selected_refs:
+                ref.filter_channel = f_chan
+                ref.filter_value = f_val
+
+            self._refresh_series_list("left")
+            self._refresh_series_list("right")
+            self.update_plot()
+            self.statusBar().showMessage(f"Applied filter to {len(selected_refs)} selected channels")
 
     def unload_selected_sources(self) -> None:
         """Remove the selected loaded files from the app."""
@@ -347,7 +578,6 @@ class TdmsBrowserWindow(QMainWindow):
         self.source_order.clear()
         self.left_axis_series = []
         self.right_axis_series = []
-        self._reset_filter_state()
         self.refresh_loaded_sources_view()
         self.refresh_tree()
         self.left_series_list.clear()
@@ -356,7 +586,7 @@ class TdmsBrowserWindow(QMainWindow):
         self.statusBar().showMessage("All loaded files cleared")
 
     def refresh_loaded_sources_view(self) -> None:
-        """Refresh the loaded-files list and summary label."""
+        """Refresh the loaded-files list."""
         self.loaded_sources_list.clear()
         for source_id in self.source_order:
             source = self.loaded_sources.get(source_id)
@@ -367,9 +597,6 @@ class TdmsBrowserWindow(QMainWindow):
             item.setToolTip(source.path)
             self.loaded_sources_list.addItem(item)
 
-        count = len(self.source_order)
-        self.file_label.setText(f"Loaded files: {count}" if count else "No files loaded")
-
     def refresh_tree(self) -> None:
         """Rebuild the tree for all loaded files."""
         self.tree.clear()
@@ -379,7 +606,9 @@ class TdmsBrowserWindow(QMainWindow):
             if source is None:
                 continue
 
-            source_item = QTreeWidgetItem([source.display_name, source.kind.upper(), ""])
+            x_desc = "Index" if source.x_channel is None else f"{source.x_channel[0]}/{source.x_channel[1]}"
+            display_text = f"{source.display_name} (dt={source.sample_rate:.3g}s, X={x_desc})"
+            source_item = QTreeWidgetItem([display_text, source.kind.upper(), ""])
             source_item.setData(0, Qt.UserRole, {"type": "source", "source_id": source_id})
             source_item.setToolTip(0, source.path)
 
@@ -414,7 +643,7 @@ class TdmsBrowserWindow(QMainWindow):
     def _selected_channel_refs(self) -> list[SeriesRef]:
         """Return selected channel references from the tree."""
         refs: list[SeriesRef] = []
-        seen: set[SeriesRef] = set()
+        seen: set[tuple[str, str, str]] = set()
         for item in self.tree.selectedItems():
             payload = item.data(0, Qt.UserRole)
             if not isinstance(payload, dict):
@@ -423,10 +652,10 @@ class TdmsBrowserWindow(QMainWindow):
             group_name = payload.get("group")
             channel_name = payload.get("channel")
             if source_id and group_name and channel_name:
-                ref = SeriesRef(str(source_id), str(group_name), str(channel_name))
-                if ref not in seen:
-                    refs.append(ref)
-                    seen.add(ref)
+                key = (str(source_id), str(group_name), str(channel_name))
+                if key not in seen:
+                    refs.append(SeriesRef(key[0], key[1], key[2]))
+                    seen.add(key)
         return refs
 
     def add_selected_to_left(self) -> None:
@@ -444,10 +673,13 @@ class TdmsBrowserWindow(QMainWindow):
 
         target_series = self.left_axis_series if axis == "left" else self.right_axis_series
         for ref in selected:
-            if ref not in target_series:
-                target_series.append(ref)
+            new_ref = SeriesRef(
+                source_id=ref.source_id,
+                group=ref.group,
+                channel=ref.channel
+            )
+            target_series.append(new_ref)
 
-        self._refresh_series_list(axis)
         self._refresh_series_list("left")
         self._refresh_series_list("right")
         self.update_plot()
@@ -495,48 +727,6 @@ class TdmsBrowserWindow(QMainWindow):
         self.right_series_list.clear()
         self.update_plot()
         self.statusBar().showMessage("Plot cleared")
-
-    def use_selected_as_filter(self) -> None:
-        """Set the selected channel as the filter channel."""
-        selected = self._selected_channel_refs()
-        if not selected:
-            QMessageBox.warning(self, "No Selection", "Please select a channel to use as filter.")
-            return
-        if len(selected) > 1:
-            QMessageBox.warning(self, "Multiple Selection", "Please select only one channel to use as filter.")
-            return
-
-        self.filter_channel = selected[0]
-        self.filter_channel_label.setText(f"Filter Channel: {self._series_ref_label(self.filter_channel)}")
-        self.statusBar().showMessage(f"Filter channel set to {self._series_ref_label(self.filter_channel)}")
-
-    def apply_filter(self) -> None:
-        """Apply the filter with the current channel and value."""
-        if self.filter_channel is None:
-            QMessageBox.warning(self, "No Filter Channel", "Please select a channel to use as filter.")
-            return
-
-        try:
-            self.filter_value = float(self.filter_value_input.text())
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Value", "Please enter a valid numeric value for the filter.")
-            return
-
-        if self.filter_channel.source_id not in self.loaded_sources:
-            QMessageBox.warning(self, "Missing Source", "The selected filter source is no longer loaded.")
-            self._reset_filter_state()
-            return
-
-        self.statusBar().showMessage(
-            f"Filter applied: {self._series_ref_label(self.filter_channel)} == {self.filter_value}"
-        )
-        self.update_plot()
-
-    def clear_filter(self) -> None:
-        """Clear the current filter."""
-        self._reset_filter_state()
-        self.statusBar().showMessage("Filter cleared")
-        self.update_plot()
 
     def update_plot(self) -> None:
         """Render the currently assigned channels on a shared plot with two Y axes."""
@@ -682,52 +872,33 @@ class TdmsBrowserWindow(QMainWindow):
                 if text_item: text_item.hide()
 
     def _get_channel_data(self, series_ref: SeriesRef) -> Optional[tuple[Any, Any]]:
-        """Return x and y arrays for the selected channel, applying a filter if needed."""
+        """Return x and y arrays for the selected channel."""
         source = self.loaded_sources.get(series_ref.source_id)
         if source is None:
             return None
-
-        series = get_channel_data(source, series_ref.group, series_ref.channel)
-        if series is None:
-            return None
-
-        x_values, y_values = series
-        if self.filter_channel is not None and self.filter_value is not None:
-            if self.filter_channel.source_id == series_ref.source_id:
-                filter_source = self.loaded_sources.get(self.filter_channel.source_id)
-                if filter_source is not None:
-                    mask = get_filter_mask(
-                        filter_source,
-                        self.filter_channel.group,
-                        self.filter_channel.channel,
-                        self.filter_value,
-                    )
-                    if mask is not None and len(mask) == len(y_values):
-                        x_values = x_values[mask]
-                        y_values = y_values[mask]
-
-        return x_values, y_values
+        return get_channel_data(
+            source,
+            series_ref.group,
+            series_ref.channel,
+            series_ref.filter_channel,
+            series_ref.filter_value,
+        )
 
     def _series_ref_label(self, series_ref: SeriesRef) -> str:
         """Return a human-friendly label for a plotted series."""
         source = self.loaded_sources.get(series_ref.source_id)
         source_name = source.display_name if source is not None else series_ref.source_id
-        return f"{source_name} / {series_ref.group} / {series_ref.channel}"
+        base_label = f"{source_name} / {series_ref.group} / {series_ref.channel}"
+        if series_ref.filter_channel is not None:
+            f_group, f_chan = series_ref.filter_channel
+            base_label += f" (F: {f_group}/{f_chan}=={series_ref.filter_value:.3g})"
+        return base_label
 
     def _prune_plot_state(self) -> None:
-        """Remove series and filter references that point to unloaded sources."""
+        """Remove series references that point to unloaded sources."""
         loaded_ids = set(self.loaded_sources)
         self.left_axis_series = [ref for ref in self.left_axis_series if ref.source_id in loaded_ids]
         self.right_axis_series = [ref for ref in self.right_axis_series if ref.source_id in loaded_ids]
-        if self.filter_channel is not None and self.filter_channel.source_id not in loaded_ids:
-            self._reset_filter_state()
-
-    def _reset_filter_state(self) -> None:
-        """Reset filter state without immediately redrawing."""
-        self.filter_channel = None
-        self.filter_value = None
-        self.filter_channel_label.setText("Filter Channel: None")
-        self.filter_value_input.clear()
 
     def _color_icon(self, color: str) -> QIcon:
         """Create a small color swatch for list entries."""

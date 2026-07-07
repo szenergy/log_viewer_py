@@ -23,15 +23,24 @@ class LoadedSource:
     display_name: str
     payload: Any
     structure: Dict[str, Any]
+    sample_rate: float = 1.0
+    x_channel: Optional[tuple[str, str]] = None  # (group_name, channel_name)
 
 
-@dataclass(frozen=True)
+@dataclass
 class SeriesRef:
-    """Reference to a specific channel in a loaded source."""
+    """Reference to a specific channel in a loaded source, representing a plotted series."""
 
     source_id: str
     group: str
     channel: str
+    series_id: str = ""
+    filter_channel: Optional[tuple[str, str]] = None  # (group_name, channel_name)
+    filter_value: float = 0.0
+
+    def __post_init__(self):
+        if not self.series_id:
+            self.series_id = uuid.uuid4().hex[:8]
 
 
 def load_data_source(filepath: str) -> LoadedSource:
@@ -175,36 +184,24 @@ def _build_csv_structure(filepath: str, frame: pd.DataFrame) -> Dict[str, Any]:
 
 def get_source_label(source: LoadedSource) -> str:
     """Return a compact label for the loaded-files list."""
-    return f"{source.display_name} [{source.kind.upper()}]"
+    x_desc = "Index" if source.x_channel is None else f"{source.x_channel[0]}/{source.x_channel[1]}"
+    return f"{source.display_name} [{source.kind.upper()}] (dt={source.sample_rate:.3g}s, X={x_desc})"
 
 
-def get_channel_data(source: LoadedSource, group_name: str, channel_name: str) -> Optional[tuple[np.ndarray, np.ndarray]]:
-    """Return x/y data for the requested channel."""
+def _get_raw_channel_data(source: LoadedSource, group_name: str, channel_name: str) -> Optional[np.ndarray]:
+    """Retrieve raw Y-values for a channel without alignment or filtering."""
     if source.kind == "tdms":
         try:
             channel = source.payload[group_name][channel_name]
-            y_values = np.asarray(channel.data)
-            if y_values.size == 0:
-                return None
-            x_values = np.arange(len(y_values))
-            return x_values, y_values
+            return np.asarray(channel.data)
         except Exception:
             return None
-
-    if source.kind == "csv":
+    elif source.kind == "csv":
         try:
-            series = pd.to_numeric(source.payload[channel_name], errors="coerce")
-            values = series.to_numpy(dtype=float)
-            mask = np.isfinite(values)
-            if not np.any(mask):
-                return None
-            x_values = np.arange(len(values))[mask]
-            y_values = values[mask]
-            return x_values, y_values
+            return pd.to_numeric(source.payload[channel_name], errors="coerce").to_numpy(dtype=float)
         except Exception:
             return None
-
-    if source.kind == "xlsx":
+    elif source.kind == "xlsx":
         try:
             df = source.payload.get(group_name)
             if df is None:
@@ -223,66 +220,80 @@ def get_channel_data(source: LoadedSource, group_name: str, channel_name: str) -
             if col_key is None:
                 return None
 
-            series = pd.to_numeric(df[col_key], errors="coerce")
-            values = series.to_numpy(dtype=float)
-            mask = np.isfinite(values)
-            if not np.any(mask):
-                return None
-            x_values = np.arange(len(values))[mask]
-            y_values = values[mask]
-            return x_values, y_values
+            return pd.to_numeric(df[col_key], errors="coerce").to_numpy(dtype=float)
         except Exception:
             return None
-
     return None
 
 
-def get_filter_mask(source: LoadedSource, group_name: str, channel_name: str, filter_value: float) -> Optional[np.ndarray]:
-    """Return a boolean mask for samples that match the requested filter value."""
-    if source.kind == "tdms":
-        try:
-            values = np.asarray(source.payload[group_name][channel_name].data)
-            if values.size == 0:
-                return None
-            return np.isclose(values, filter_value)
-        except Exception:
-            return None
+def get_channel_data(
+    source: LoadedSource,
+    group_name: str,
+    channel_name: str,
+    filter_channel: Optional[tuple[str, str]] = None,
+    filter_value: float = 0.0
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Return x/y data for the requested channel, aligned and filtered."""
+    y_raw = _get_raw_channel_data(source, group_name, channel_name)
+    if y_raw is None or len(y_raw) == 0:
+        return None
 
-    if source.kind == "csv":
-        try:
-            series = pd.to_numeric(source.payload[channel_name], errors="coerce")
-            values = series.to_numpy(dtype=float)
-            if values.size == 0:
-                return None
-            return np.isclose(values, filter_value)
-        except Exception:
-            return None
+    # Load X-axis raw data
+    x_raw = None
+    if source.x_channel is not None:
+        x_group, x_chan = source.x_channel
+        x_raw = _get_raw_channel_data(source, x_group, x_chan)
 
-    if source.kind == "xlsx":
-        try:
-            df = source.payload.get(group_name)
-            if df is None:
-                for k, v in source.payload.items():
-                    if str(k) == group_name:
-                        df = v
-                        break
-            if df is None:
-                return None
+    # Align X and Y raw data
+    if x_raw is None or len(x_raw) == 0:
+        x_values = np.arange(len(y_raw)) * getattr(source, "sample_rate", 1.0)
+        y_values = y_raw
+    else:
+        min_len = min(len(x_raw), len(y_raw))
+        x_values = x_raw[:min_len]
+        y_values = y_raw[:min_len]
 
-            col_key = None
-            for col in df.columns:
-                if str(col) == channel_name:
-                    col_key = col
-                    break
-            if col_key is None:
-                return None
+    # Apply filter if configured
+    if filter_channel is not None:
+        f_group, f_chan = filter_channel
+        f_raw = _get_raw_channel_data(source, f_group, f_chan)
+        if f_raw is not None and len(f_raw) > 0:
+            min_len = min(len(x_values), len(f_raw))
+            x_values = x_values[:min_len]
+            y_values = y_values[:min_len]
+            f_aligned = f_raw[:min_len]
 
-            series = pd.to_numeric(df[col_key], errors="coerce")
-            values = series.to_numpy(dtype=float)
-            if values.size == 0:
-                return None
-            return np.isclose(values, filter_value)
-        except Exception:
-            return None
+            # Generate filter mask (matching the configured filter value)
+            f_mask = np.isclose(f_aligned, filter_value)
+            x_values = x_values[f_mask]
+            y_values = y_values[f_mask]
 
-    return None
+    # Filter invalid/non-numeric values
+    mask = np.isfinite(x_values) & np.isfinite(y_values)
+    if not np.any(mask):
+        return None
+
+    x_res = x_values[mask]
+    y_res = y_values[mask]
+
+    # Shift X axis so the first remaining point starts at X=0
+    if filter_channel is not None and len(x_res) > 0:
+        x_res = x_res - x_res[0]
+
+    return x_res, y_res
+
+
+def get_filter_mask(
+    source: LoadedSource,
+    group_name: str,
+    channel_name: str,
+    filter_value: float,
+    filter_channel: Optional[tuple[str, str]] = None,
+    filter_val: float = 0.0
+) -> Optional[np.ndarray]:
+    """Return a boolean mask for samples that match the requested filter value, aligned with the configured X axis."""
+    aligned = get_channel_data(source, group_name, channel_name, filter_channel, filter_val)
+    if aligned is None:
+        return None
+    _, y_values = aligned
+    return np.isclose(y_values, filter_value)
