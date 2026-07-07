@@ -39,3 +39,6 @@ output/*.xls
 # OS
 .DS_Store
 Thumbs.db
+
+
+SZEnergy Log Viewer.spec

@@ -336,14 +336,70 @@ class TdmsBrowserWindow(QMainWindow):
         self.setStatusBar(status_bar)
         self.statusBar().showMessage("Ready")
 
+    def _open_native_file_dialog(self) -> Optional[list[str]]:
+        """Attempt to open the native OS file picker (zenity/kdialog on Linux)."""
+        import subprocess
+        import shutil
+
+        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        prefer_kde = "kde" in desktop or "plasma" in desktop
+
+        candidates = ["kdialog", "zenity"] if prefer_kde else ["zenity", "kdialog"]
+
+        for tool in candidates:
+            if shutil.which(tool):
+                if tool == "zenity":
+                    try:
+                        cmd = [
+                            "zenity",
+                            "--file-selection",
+                            "--multiple",
+                            "--separator=|",
+                            "--title=Open Files",
+                            "--file-filter=Data Files | *.tdms *.csv *.xlsx *.xls",
+                            "--file-filter=All Files | *"
+                        ]
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            paths = result.stdout.strip().split("|")
+                            return [p for p in paths if p]
+                        elif result.returncode == 1:
+                            return []  # User cancelled
+                    except Exception:
+                        pass
+                elif tool == "kdialog":
+                    try:
+                        cmd = [
+                            "kdialog",
+                            "--getopenfilename",
+                            os.getcwd(),
+                            "*.tdms *.csv *.xlsx *.xls|Data Files\n*|All Files",
+                            "--multiple",
+                            "--separate-output"
+                        ]
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            paths = result.stdout.strip().split("\n")
+                            return [p for p in paths if p]
+                        elif result.returncode == 1:
+                            return []  # User cancelled
+                    except Exception:
+                        pass
+        return None
+
     def open_file_dialog(self) -> None:
-        """Open one or more TDMS/CSV/Excel files from disk."""
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Open Files",
-            os.getcwd(),
-            "Data Files (*.tdms *.csv *.xlsx *.xls);;TDMS Files (*.tdms);;CSV Files (*.csv);;Excel Files (*.xlsx *.xls);;All Files (*)",
-        )
+        """Open one or more TDMS/CSV/Excel files from disk, using native picker if possible."""
+        file_paths = self._open_native_file_dialog()
+
+        # If native picker was not available or failed to execute, fall back to Qt file dialog
+        if file_paths is None:
+            file_paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Open Files",
+                os.getcwd(),
+                "Data Files (*.tdms *.csv *.xlsx *.xls);;TDMS Files (*.tdms);;CSV Files (*.csv);;Excel Files (*.xlsx *.xls);;All Files (*)",
+            )
+
         if file_paths:
             self.load_files(file_paths)
 
