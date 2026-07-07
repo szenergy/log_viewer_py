@@ -15,15 +15,13 @@ from src.gui.multi_source_app import run_gui
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Convert TDMS files to Excel format or launch the TDMS GUI browser",
+        description="GUI data visualizer and TDMS to Excel converter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  python main.py
   python main.py test_data/Test_17_06_2026_05_46_54.tdms
   python main.py test_data/Test_17_06_2026_05_46_54.tdms -o output/converted.xlsx
-  python main.py test_data/Test_17_06_2026_05_46_54.tdms -v
-  python main.py --gui
-  python main.py --gui test_data/Test_17_06_2026_05_46_54.tdms
         """
     )
 
@@ -48,24 +46,24 @@ Examples:
     )
     
     parser.add_argument(
-        '-v', '--verbose',
+        '-q', '--quiet',
         action='store_true',
-        help='Print progress information'
+        help='Suppress progress information'
     )
     
     args = parser.parse_args()
 
-    if args.gui:
+    if not args.excel_file:
         return run_gui(args.tdms_file)
 
     if not args.tdms_file:
-        parser.error('tdms_file is required unless --gui is used')
+        parser.error('tdms_file is required for conversion.')
     
     try:
         output_path = convert_tdms_to_excel(
             tdms_path=args.tdms_file,
             excel_path=args.excel_file,
-            verbose=args.verbose
+            verbose=(not args.quiet)
         )
         
         print(f"\nSuccess! Excel file created at: {output_path}")

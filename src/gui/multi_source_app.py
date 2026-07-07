@@ -94,27 +94,11 @@ class TdmsBrowserWindow(QMainWindow):
         self.cursor_items = []
         self.cursor_items_right = []
 
-        # Cursor widgets & line
-        self.cursor_label = QLabel("Hover over the plot to inspect values")
-        self.cursor_label.setWordWrap(True)
-        self.cursor_label.setStyleSheet(
-            "QLabel { background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; padding: 8px; font-family: monospace; font-size: 11px; }"
-        )
-
         self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#777777", width=1.5, style=Qt.DashLine))
         self.v_line.hide()
 
         self.open_button = QPushButton("Load Files")
         self.open_button.clicked.connect(self.open_file_dialog)
-
-        self.file_label = QLabel("No files loaded")
-        self.file_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        top_bar = QWidget()
-        top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.addWidget(self.open_button)
-        top_layout.addWidget(self.file_label, 1)
 
         self.loaded_sources_list = QListWidget()
         self.loaded_sources_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -128,6 +112,7 @@ class TdmsBrowserWindow(QMainWindow):
         loaded_layout = QVBoxLayout(loaded_box)
         loaded_layout.addWidget(self.loaded_sources_list)
         loaded_button_row = QHBoxLayout()
+        loaded_button_row.addWidget(self.open_button)
         loaded_button_row.addWidget(self.unload_selected_button)
         loaded_button_row.addWidget(self.clear_loaded_button)
         loaded_layout.addLayout(loaded_button_row)
@@ -202,7 +187,6 @@ class TdmsBrowserWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self.plot_widget, 4)
-        right_layout.addWidget(self.cursor_label)
         right_layout.addWidget(selection_box, 2)
         right_layout.addWidget(filter_box, 1)
 
@@ -222,7 +206,6 @@ class TdmsBrowserWindow(QMainWindow):
 
         central_widget = QWidget()
         central_layout = QVBoxLayout(central_widget)
-        central_layout.addWidget(top_bar)
         central_layout.addWidget(splitter, 1)
         self.setCentralWidget(central_widget)
 
@@ -690,7 +673,6 @@ class TdmsBrowserWindow(QMainWindow):
                     text_item.setPos(nearest_x, nearest_y)
                     text_item.show()
 
-            self.cursor_label.setText(f"<b>Cursor Position:</b> X = {x:.4g}")
         else:
             self.v_line.hide()
             for item in getattr(self, "plotted_data_cache", []):
@@ -698,7 +680,6 @@ class TdmsBrowserWindow(QMainWindow):
                 text_item = item.get("text_item")
                 if dot: dot.hide()
                 if text_item: text_item.hide()
-            self.cursor_label.setText("Hover over the plot to inspect values")
 
     def _get_channel_data(self, series_ref: SeriesRef) -> Optional[tuple[Any, Any]]:
         """Return x and y arrays for the selected channel, applying a filter if needed."""
