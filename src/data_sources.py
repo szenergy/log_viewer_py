@@ -23,7 +23,8 @@ class LoadedSource:
     display_name: str
     payload: Any
     structure: Dict[str, Any]
-    sample_rate: float = 1.0
+    prescaler: float = 1.0
+    offset: float = 0.0
     x_channel: Optional[tuple[str, str]] = None  # (group_name, channel_name)
 
 
@@ -37,6 +38,7 @@ class SeriesRef:
     series_id: str = ""
     filter_channel: Optional[tuple[str, str]] = None  # (group_name, channel_name)
     filter_value: float = 0.0
+    color: Optional[str] = None
 
     def __post_init__(self):
         if not self.series_id:
@@ -185,7 +187,7 @@ def _build_csv_structure(filepath: str, frame: pd.DataFrame) -> Dict[str, Any]:
 def get_source_label(source: LoadedSource) -> str:
     """Return a compact label for the loaded-files list."""
     x_desc = "Index" if source.x_channel is None else f"{source.x_channel[0]}/{source.x_channel[1]}"
-    return f"{source.display_name} [{source.kind.upper()}] (dt={source.sample_rate:.3g}s, X={x_desc})"
+    return f"{source.display_name} [{source.kind.upper()}]\n(Mult ={source.prescaler:.3g}, Offset = {source.offset:.3g}, X = {x_desc})"
 
 
 def _get_raw_channel_data(source: LoadedSource, group_name: str, channel_name: str) -> Optional[np.ndarray]:
@@ -246,12 +248,17 @@ def get_channel_data(
 
     # Align X and Y raw data
     if x_raw is None or len(x_raw) == 0:
-        x_values = np.arange(len(y_raw)) * getattr(source, "sample_rate", 1.0)
+        x_values = np.arange(len(y_raw))
         y_values = y_raw
     else:
         min_len = min(len(x_raw), len(y_raw))
         x_values = x_raw[:min_len]
         y_values = y_raw[:min_len]
+
+    # Apply prescaler and offset
+    prescaler = getattr(source, "prescaler", 1.0)
+    offset = getattr(source, "offset", 0.0)
+    x_values = (x_values * prescaler) + offset
 
     # Apply filter if configured
     if filter_channel is not None:
@@ -276,7 +283,7 @@ def get_channel_data(
     x_res = x_values[mask]
     y_res = y_values[mask]
 
-    # Shift X axis so the first remaining point starts at X=0
+    # Shift X axis so the first remaining point starts at X=0 when filtering is active
     if filter_channel is not None and len(x_res) > 0:
         x_res = x_res - x_res[0]
 

@@ -42,27 +42,35 @@ from src.data_sources import LoadedSource, SeriesRef, get_channel_data, get_filt
 
 
 class FileConfigDialog(QDialog):
-    """Modal dialog to configure a source's sample rate and X-axis channel."""
+    """Modal dialog to configure a source's prescaler, offset, and X-axis channel."""
 
     def __init__(self, source: LoadedSource, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Configure Source: {source.display_name}")
-        self.resize(450, 180)
+        self.setWindowTitle(f"Configure Source")
+        self.resize(450, 200)
 
         self.source = source
 
         layout = QVBoxLayout(self)
 
         form_layout = QFormLayout()
+        form_layout.addRow(QLabel(f"File: {source.display_name}"))
 
-        # Sample rate
-        self.rate_spin = QDoubleSpinBox()
-        self.rate_spin.setRange(0.00001, 1000000.0)
-        self.rate_spin.setDecimals(5)
-        self.rate_spin.setSingleStep(0.1)
-        self.rate_spin.setSuffix(" s")
-        self.rate_spin.setValue(source.sample_rate)
-        form_layout.addRow("Sample Rate (seconds):", self.rate_spin)
+        # Prescaler
+        self.prescaler_spin = QDoubleSpinBox()
+        self.prescaler_spin.setRange(-1000000000.0, 1000000000.0)
+        self.prescaler_spin.setDecimals(6)
+        self.prescaler_spin.setSingleStep(0.1)
+        self.prescaler_spin.setValue(source.prescaler)
+        form_layout.addRow("X-Axis Multiplier:", self.prescaler_spin)
+
+        # Offset
+        self.offset_spin = QDoubleSpinBox()
+        self.offset_spin.setRange(-1000000000.0, 1000000000.0)
+        self.offset_spin.setDecimals(6)
+        self.offset_spin.setSingleStep(1.0)
+        self.offset_spin.setValue(source.offset)
+        form_layout.addRow("X-Axis Offset:", self.offset_spin)
 
         # X-axis combo box
         self.x_combo = QComboBox()
@@ -101,10 +109,11 @@ class FileConfigDialog(QDialog):
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
 
-    def get_settings(self) -> tuple[float, Optional[tuple[str, str]]]:
-        """Return the configured sample rate and X-axis channel."""
+    def get_settings(self) -> tuple[float, float, Optional[tuple[str, str]]]:
+        """Return the configured prescaler, offset, and X-axis channel."""
         return (
-            self.rate_spin.value(),
+            self.prescaler_spin.value(),
+            self.offset_spin.value(),
             self.x_combo.currentData()
         )
 
@@ -235,6 +244,18 @@ class TdmsBrowserWindow(QMainWindow):
         self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#777777", width=1.5, style=Qt.DashLine))
         self.v_line.hide()
 
+        self.L_prev = None
+        self.R_prev = None
+        self._is_syncing = False
+
+        self.cursor_tooltip = pg.TextItem(
+            anchor=(-0.1, 0.1),
+            color='k',
+            fill=(255, 255, 255, 225),
+            border=pg.mkPen('#777777', width=1)
+        )
+        self.cursor_tooltip.hide()
+
         self.open_button = QPushButton("Load Files")
         self.open_button.clicked.connect(self.open_file_dialog)
 
@@ -257,24 +278,24 @@ class TdmsBrowserWindow(QMainWindow):
         loaded_layout.addLayout(loaded_button_row)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["TDMS / CSV Structure", "Min", "Max"])
+        self.tree.setHeaderLabels(["Loaded file structure", "Min", "Max"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.itemDoubleClicked.connect(self.configure_source_by_tree_item)
 
         self.plot_widget = pg.GraphicsLayoutWidget()
         self.plot_widget.setBackground("w")
         self.plot_item = self.plot_widget.addPlot(row=0, col=0)
         self.plot_item.showGrid(x=True, y=True, alpha=0.25)
-        self.plot_item.setLabel("bottom", "Sample index")
-        self.plot_item.setLabel("left", "Left axis")
 
         self.right_view_box = pg.ViewBox()
         self.plot_item.showAxis("right")
         self.plot_item.getAxis("right").linkToView(self.right_view_box)
         self.right_view_box.setXLink(self.plot_item)
         self.plot_item.scene().addItem(self.right_view_box)
-        self.plot_item.getAxis("right").setLabel("Right axis")
         self.plot_item.vb.sigResized.connect(self._update_right_view)
+        self.plot_item.vb.sigYRangeChanged.connect(self.sync_right_y_zoom)
+        self.right_view_box.sigYRangeChanged.connect(self.on_right_y_range_changed)
 
         # Cursor line addition and interaction
         self.plot_item.addItem(self.v_line, ignoreBounds=True)
@@ -291,10 +312,8 @@ class TdmsBrowserWindow(QMainWindow):
         self.assign_left_button.clicked.connect(self.add_selected_to_left)
         self.assign_right_button = QPushButton("Add Selected To Right")
         self.assign_right_button.clicked.connect(self.add_selected_to_right)
-        self.remove_left_button = QPushButton("Remove From Left")
-        self.remove_left_button.clicked.connect(lambda: self.remove_from_axis("left"))
-        self.remove_right_button = QPushButton("Remove From Right")
-        self.remove_right_button.clicked.connect(lambda: self.remove_from_axis("right"))
+        self.remove_selected_button = QPushButton("Remove Selected")
+        self.remove_selected_button.clicked.connect(self.remove_selected_from_plot)
         self.set_batch_filter_button = QPushButton("Set Filter for Selected")
         self.set_batch_filter_button.clicked.connect(self.set_filter_for_selected)
         self.clear_plot_button = QPushButton("Clear Plot")
@@ -304,10 +323,13 @@ class TdmsBrowserWindow(QMainWindow):
         selection_layout = QGridLayout(selection_box)
         selection_layout.addWidget(self.left_series_list, 1, 0)
         selection_layout.addWidget(self.right_series_list, 1, 1)
-        selection_layout.addWidget(self.remove_left_button, 2, 0)
-        selection_layout.addWidget(self.remove_right_button, 2, 1)
-        selection_layout.addWidget(self.set_batch_filter_button, 3, 0, 1, 2)
-        selection_layout.addWidget(self.clear_plot_button, 4, 0, 1, 2)
+
+        # Button row containing all buttons next to each other
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.remove_selected_button)
+        button_row.addWidget(self.set_batch_filter_button)
+        button_row.addWidget(self.clear_plot_button)
+        selection_layout.addLayout(button_row, 2, 0, 1, 2)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -331,10 +353,6 @@ class TdmsBrowserWindow(QMainWindow):
         central_layout = QVBoxLayout(central_widget)
         central_layout.addWidget(splitter, 1)
         self.setCentralWidget(central_widget)
-
-        status_bar = QStatusBar()
-        self.setStatusBar(status_bar)
-        self.statusBar().showMessage("Ready")
 
     def _open_native_file_dialog(self) -> Optional[list[str]]:
         """Attempt to open the native OS file picker (zenity/kdialog on Linux)."""
@@ -389,7 +407,10 @@ class TdmsBrowserWindow(QMainWindow):
 
     def open_file_dialog(self) -> None:
         """Open one or more TDMS/CSV/Excel files from disk, using native picker if possible."""
-        file_paths = self._open_native_file_dialog()
+        
+        # Disabled native picker due to performance issues
+        # file_paths = self._open_native_file_dialog()
+        file_paths = None
 
         # If native picker was not available or failed to execute, fall back to Qt file dialog
         if file_paths is None:
@@ -419,8 +440,6 @@ class TdmsBrowserWindow(QMainWindow):
             paths_to_load.append(file_path)
 
         if not paths_to_load:
-            if skipped_count:
-                self.statusBar().showMessage("Selected files are already loaded")
             return
 
         # Setup Progress Dialog
@@ -471,16 +490,13 @@ class TdmsBrowserWindow(QMainWindow):
                 for source in new_sources:
                     dialog = FileConfigDialog(source, self)
                     if dialog.exec() == QDialog.Accepted:
-                        rate, x_chan = dialog.get_settings()
-                        source.sample_rate = rate
+                        prescaler, offset, x_chan = dialog.get_settings()
+                        source.prescaler = prescaler
+                        source.offset = offset
                         source.x_channel = x_chan
 
                 self.refresh_loaded_sources_view()
                 self.refresh_tree()
-                self.statusBar().showMessage(f"Loaded {loaded_count} file(s)")
-
-            if skipped_count and not loaded_count and not errors:
-                self.statusBar().showMessage("Selected files are already loaded")
 
             if errors:
                 QMessageBox.warning(
@@ -488,9 +504,6 @@ class TdmsBrowserWindow(QMainWindow):
                     "Some Files Could Not Be Loaded",
                     "\n".join(errors),
                 )
-
-            if loaded_count == 0 and not errors and skipped_count == 0:
-                self.statusBar().showMessage("No files loaded")
 
             # Clean up references
             self.loader_thread = None
@@ -516,14 +529,37 @@ class TdmsBrowserWindow(QMainWindow):
 
         dialog = FileConfigDialog(source, self)
         if dialog.exec() == QDialog.Accepted:
-            rate, x_chan = dialog.get_settings()
-            source.sample_rate = rate
+            prescaler, offset, x_chan = dialog.get_settings()
+            source.prescaler = prescaler
+            source.offset = offset
             source.x_channel = x_chan
 
             self.refresh_loaded_sources_view()
             self.refresh_tree()
             self.update_plot()
-            self.statusBar().showMessage(f"Updated configuration for {source.display_name}")
+
+    def configure_source_by_tree_item(self, item: QTreeWidgetItem, column: int) -> None:
+        """Open the configuration dialog for a loaded file when double-clicked in the tree."""
+        payload = item.data(0, Qt.UserRole)
+        if not isinstance(payload, dict) or payload.get("type") != "source":
+            return
+        source_id = payload.get("source_id")
+        if not source_id:
+            return
+        source = self.loaded_sources.get(str(source_id))
+        if source is None:
+            return
+
+        dialog = FileConfigDialog(source, self)
+        if dialog.exec() == QDialog.Accepted:
+            prescaler, offset, x_chan = dialog.get_settings()
+            source.prescaler = prescaler
+            source.offset = offset
+            source.x_channel = x_chan
+
+            self.refresh_loaded_sources_view()
+            self.refresh_tree()
+            self.update_plot()
 
     def configure_series_by_item(self, item: QListWidgetItem, axis: str) -> None:
         """Open the configuration dialog for a plotted channel when double-clicked."""
@@ -548,7 +584,6 @@ class TdmsBrowserWindow(QMainWindow):
 
             self._refresh_series_list(axis)
             self.update_plot()
-            self.statusBar().showMessage(f"Updated filter for plotted channel: {ref.channel}")
 
     def set_filter_for_selected(self) -> None:
         """Set the same filter settings for all selected channels in the axis lists (must be from the same file)."""
@@ -600,7 +635,6 @@ class TdmsBrowserWindow(QMainWindow):
             self._refresh_series_list("left")
             self._refresh_series_list("right")
             self.update_plot()
-            self.statusBar().showMessage(f"Applied filter to {len(selected_refs)} selected channels")
 
     def unload_selected_sources(self) -> None:
         """Remove the selected loaded files from the app."""
@@ -623,7 +657,6 @@ class TdmsBrowserWindow(QMainWindow):
         self._refresh_series_list("left")
         self._refresh_series_list("right")
         self.update_plot()
-        self.statusBar().showMessage(f"Unloaded {len(source_ids)} file(s)")
 
     def clear_loaded_sources(self) -> None:
         """Remove all loaded sources and plotted series."""
@@ -639,7 +672,6 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_series_list.clear()
         self.right_series_list.clear()
         self.update_plot()
-        self.statusBar().showMessage("All loaded files cleared")
 
     def refresh_loaded_sources_view(self) -> None:
         """Refresh the loaded-files list."""
@@ -663,8 +695,8 @@ class TdmsBrowserWindow(QMainWindow):
                 continue
 
             x_desc = "Index" if source.x_channel is None else f"{source.x_channel[0]}/{source.x_channel[1]}"
-            display_text = f"{source.display_name} (dt={source.sample_rate:.3g}s, X={x_desc})"
-            source_item = QTreeWidgetItem([display_text, source.kind.upper(), ""])
+            display_text = f"{source.display_name}"
+            source_item = QTreeWidgetItem([display_text, "", ""])
             source_item.setData(0, Qt.UserRole, {"type": "source", "source_id": source_id})
             source_item.setToolTip(0, source.path)
 
@@ -729,10 +761,21 @@ class TdmsBrowserWindow(QMainWindow):
 
         target_series = self.left_axis_series if axis == "left" else self.right_axis_series
         for ref in selected:
+            used_colors = {s.color for s in self.left_axis_series + self.right_axis_series if getattr(s, "color", None)}
+            chosen_color = None
+            for color in self.series_palette:
+                if color not in used_colors:
+                    chosen_color = color
+                    break
+            if not chosen_color:
+                total_plotted = len(self.left_axis_series) + len(self.right_axis_series)
+                chosen_color = self.series_palette[total_plotted % len(self.series_palette)]
+
             new_ref = SeriesRef(
                 source_id=ref.source_id,
                 group=ref.group,
-                channel=ref.channel
+                channel=ref.channel,
+                color=chosen_color
             )
             target_series.append(new_ref)
 
@@ -741,7 +784,6 @@ class TdmsBrowserWindow(QMainWindow):
         self.update_plot()
 
         axis_name = "left" if axis == "left" else "right"
-        self.statusBar().showMessage(f"Added {len(selected)} channel(s) to {axis_name} axis")
 
     def _refresh_series_list(self, axis: str) -> None:
         """Refresh the plotted-series list for one axis."""
@@ -750,30 +792,33 @@ class TdmsBrowserWindow(QMainWindow):
 
         target_widget.clear()
         for index, ref in enumerate(target_series):
-            color = self._series_color(axis, index, len(self.left_axis_series))
+            if not getattr(ref, "color", None):
+                ref.color = self._series_color(axis, index, len(self.left_axis_series))
+            color = ref.color
             item = QListWidgetItem(self._series_ref_label(ref))
             item.setIcon(self._color_icon(color))
             target_widget.addItem(item)
 
-    def remove_from_axis(self, axis: str) -> None:
-        """Remove selected items from one of the axis lists."""
-        target_series = self.left_axis_series if axis == "left" else self.right_axis_series
-        target_widget = self.left_series_list if axis == "left" else self.right_series_list
+    def remove_selected_from_plot(self) -> None:
+        """Remove all selected items in the Left and Right axis lists from the plot."""
+        left_rows = sorted({item.row() for item in self.left_series_list.selectedIndexes()}, reverse=True)
+        right_rows = sorted({item.row() for item in self.right_series_list.selectedIndexes()}, reverse=True)
 
-        rows = sorted({item.row() for item in target_widget.selectedIndexes()}, reverse=True)
-        if not rows:
-            return
+        removed_count = 0
+        for row in left_rows:
+            if 0 <= row < len(self.left_axis_series):
+                del self.left_axis_series[row]
+                removed_count += 1
 
-        for row in rows:
-            if 0 <= row < len(target_series):
-                del target_series[row]
+        for row in right_rows:
+            if 0 <= row < len(self.right_axis_series):
+                del self.right_axis_series[row]
+                removed_count += 1
 
-        self._refresh_series_list("left")
-        self._refresh_series_list("right")
-        self.update_plot()
-
-        axis_name = "left" if axis == "left" else "right"
-        self.statusBar().showMessage(f"Removed {len(rows)} channel(s) from {axis_name} axis")
+        if removed_count > 0:
+            self._refresh_series_list("left")
+            self._refresh_series_list("right")
+            self.update_plot()
 
     def clear_assignments(self) -> None:
         """Clear both axis assignments and reset the plot."""
@@ -782,11 +827,10 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_series_list.clear()
         self.right_series_list.clear()
         self.update_plot()
-        self.statusBar().showMessage("Plot cleared")
 
     def update_plot(self) -> None:
         """Render the currently assigned channels on a shared plot with two Y axes."""
-        # Clean up any existing hover dots and texts
+        # Clean up any existing hover dots
         for item in self.cursor_items:
             try:
                 self.plot_item.removeItem(item)
@@ -803,8 +847,7 @@ class TdmsBrowserWindow(QMainWindow):
 
         self.plot_item.clear()
         self.right_view_box.clear()
-        self.plot_item.setLabel("left", "Left axis")
-        self.plot_item.getAxis("right").setLabel("Right axis")
+        self.plot_item.addItem(self.cursor_tooltip, ignoreBounds=True)
 
         self.plotted_data_cache = []
 
@@ -816,19 +859,20 @@ class TdmsBrowserWindow(QMainWindow):
             if series is None:
                 continue
             x_values, y_values = series
-            color = self._series_color("left", index, len(self.left_axis_series))
+            if not getattr(ref, "color", None):
+                ref.color = self._series_color("left", index, len(self.left_axis_series))
+            color = ref.color
             curve = self.plot_item.plot(x_values, y_values, pen=pg.mkPen(color, width=2))
+            curve.setDownsampling(auto=True, method='peak')
+            if hasattr(curve, 'setSkipFiniteCheck'):
+                curve.setSkipFiniteCheck(True)
             left_curves.append(curve)
 
             # Create interactive cursor indicators
             dot = pg.ScatterPlotItem(size=8, brush=pg.mkBrush(color), pen=pg.mkPen('w', width=1))
             dot.hide()
-            text = pg.TextItem(anchor=(-0.15, 0.5), color='k', fill=(255, 255, 255, 200), border=pg.mkPen(color, width=1))
-            text.hide()
             self.plot_item.addItem(dot)
-            self.plot_item.addItem(text)
             self.cursor_items.append(dot)
-            self.cursor_items.append(text)
 
             self.plotted_data_cache.append({
                 "label": self._series_ref_label(ref),
@@ -837,7 +881,6 @@ class TdmsBrowserWindow(QMainWindow):
                 "axis": "Left",
                 "color": color,
                 "dot_item": dot,
-                "text_item": text
             })
 
         for index, ref in enumerate(self.right_axis_series):
@@ -845,20 +888,21 @@ class TdmsBrowserWindow(QMainWindow):
             if series is None:
                 continue
             x_values, y_values = series
-            color = self._series_color("right", index, len(self.left_axis_series))
+            if not getattr(ref, "color", None):
+                ref.color = self._series_color("right", index, len(self.left_axis_series))
+            color = ref.color
             curve = pg.PlotDataItem(x_values, y_values, pen=pg.mkPen(color, width=2))
+            curve.setDownsampling(auto=True, method='peak')
+            if hasattr(curve, 'setSkipFiniteCheck'):
+                curve.setSkipFiniteCheck(True)
             self.right_view_box.addItem(curve)
             right_curves.append(curve)
 
             # Create interactive cursor indicators (Right Y-axis scale)
             dot = pg.ScatterPlotItem(size=8, brush=pg.mkBrush(color), pen=pg.mkPen('w', width=1))
             dot.hide()
-            text = pg.TextItem(anchor=(-0.15, 0.5), color='k', fill=(255, 255, 255, 200), border=pg.mkPen(color, width=1))
-            text.hide()
             self.right_view_box.addItem(dot)
-            self.right_view_box.addItem(text)
             self.cursor_items_right.append(dot)
-            self.cursor_items_right.append(text)
 
             self.plotted_data_cache.append({
                 "label": self._series_ref_label(ref),
@@ -867,22 +911,31 @@ class TdmsBrowserWindow(QMainWindow):
                 "axis": "Right",
                 "color": color,
                 "dot_item": dot,
-                "text_item": text
             })
 
         # Add the vertical cursor line back on top of the left-axis curves
         self.plot_item.addItem(self.v_line, ignoreBounds=True)
 
-        if right_curves:
-            self._update_right_view()
-        else:
-            self.plot_item.getAxis("right").setLabel("Right axis")
+        if left_curves or right_curves:
+            self.plot_item.vb.autoRange()
 
-        if not left_curves and not right_curves:
-            self.plot_item.setLabel("left", "Left axis")
+        if right_curves:
+            self.right_view_box.autoRange()
+            self._update_right_view()
+
+        # Update baseline ranges for synchronized zooming
+        self.L_prev = self.plot_item.vb.viewRange()[1]
+        self.R_prev = self.right_view_box.viewRange()[1]
+        # else:
+        #     self.plot_item.getAxis("right").setLabel("Right axis")
+
+        # if not left_curves and not right_curves:
+        #     self.plot_item.setLabel("left", "Left axis")
+
+
 
     def mouse_moved(self, evt) -> None:
-        """Handle mouse movement to update the vertical cursor line and show values next to data points."""
+        """Handle mouse movement to update the vertical cursor line and show values inside a floating tooltip."""
         pos = evt
         if self.plot_item.vb.sceneBoundingRect().contains(pos):
             mousePoint = self.plot_item.vb.mapSceneToView(pos)
@@ -892,40 +945,51 @@ class TdmsBrowserWindow(QMainWindow):
             self.v_line.setValue(x)
             self.v_line.show()
 
+            html_rows = [f"<b>X:</b> {x:.6g}"]
+
             for item in getattr(self, "plotted_data_cache", []):
                 x_vals = item["x_values"]
                 y_vals = item["y_values"]
                 dot = item.get("dot_item")
-                text_item = item.get("text_item")
+                label_text = item.get("label")
+                color = item.get("color")
 
                 if x_vals is None or len(x_vals) == 0:
                     if dot: dot.hide()
-                    if text_item: text_item.hide()
                     continue
 
-                # Find nearest x index
-                idx = np.argmin(np.abs(x_vals - x))
-                nearest_x = x_vals[idx]
-                nearest_y = y_vals[idx]
+                # Find nearest x index using fast binary search (fallback to argmin if not sorted)
+                if len(x_vals) > 0:
+                    idx = np.searchsorted(x_vals, x)
+                    idx = np.clip(idx, 0, len(x_vals) - 1)
+                    if idx > 0 and abs(x_vals[idx - 1] - x) < abs(x_vals[idx] - x):
+                        idx -= 1
+                    nearest_x = x_vals[idx]
+                    nearest_y = y_vals[idx]
+                else:
+                    continue
 
                 # Update dot position
                 if dot:
                     dot.setData(x=[nearest_x], y=[nearest_y])
                     dot.show()
 
-                # Update text position and content
-                if text_item:
-                    text_item.setText(f"{nearest_y:.6g}")
-                    text_item.setPos(nearest_x, nearest_y)
-                    text_item.show()
+                # Add row to tooltip
+                html_rows.append(
+                    f'<span style="color: {color}; font-size: 14px;">●</span> {nearest_y:.6g}'
+                )
+
+            # Set tooltip text and position it next to the mouse cursor
+            self.cursor_tooltip.setHtml("<br/>".join(html_rows))
+            self.cursor_tooltip.setPos(x, mousePoint.y())
+            self.cursor_tooltip.show()
 
         else:
             self.v_line.hide()
+            self.cursor_tooltip.hide()
             for item in getattr(self, "plotted_data_cache", []):
                 dot = item.get("dot_item")
-                text_item = item.get("text_item")
                 if dot: dot.hide()
-                if text_item: text_item.hide()
 
     def _get_channel_data(self, series_ref: SeriesRef) -> Optional[tuple[Any, Any]]:
         """Return x and y arrays for the selected channel."""
@@ -947,7 +1011,7 @@ class TdmsBrowserWindow(QMainWindow):
         base_label = f"{source_name} / {series_ref.group} / {series_ref.channel}"
         if series_ref.filter_channel is not None:
             f_group, f_chan = series_ref.filter_channel
-            base_label += f" (F: {f_group}/{f_chan}=={series_ref.filter_value:.3g})"
+            base_label += f"\n({f_group} / {f_chan} == {series_ref.filter_value:.3g})"
         return base_label
 
     def _prune_plot_state(self) -> None:
@@ -978,6 +1042,59 @@ class TdmsBrowserWindow(QMainWindow):
         """Keep the secondary view box aligned with the main plot area."""
         self.right_view_box.setGeometry(self.plot_item.vb.sceneBoundingRect())
         self.right_view_box.linkedViewChanged(self.plot_item.vb, self.right_view_box.XAxis)
+
+    def sync_right_y_zoom(self) -> None:
+        """Synchronize the right Y-axis zoom/pan with the left Y-axis."""
+        if getattr(self, "_is_syncing", False):
+            return
+        self._is_syncing = True
+        try:
+            L_curr = self.plot_item.vb.viewRange()[1]
+            R_curr = self.right_view_box.viewRange()[1]
+
+            if self.L_prev is not None and self.R_prev is not None:
+                L_prev_min, L_prev_max = self.L_prev
+                L_curr_min, L_curr_max = L_curr
+                R_prev_min, R_prev_max = self.R_prev
+
+                L_width_prev = L_prev_max - L_prev_min
+                L_width_curr = L_curr_max - L_curr_min
+
+                if L_width_prev > 0 and L_width_curr > 0:
+                    # Calculate scale factor
+                    scale = L_width_curr / L_width_prev
+
+                    # Calculate relative pan shift
+                    L_center_prev = (L_prev_min + L_prev_max) / 2
+                    L_center_curr = (L_curr_min + L_curr_max) / 2
+                    shift_left = (L_center_curr - L_center_prev) / L_width_prev
+
+                    # Apply to right axis
+                    R_width_prev = R_prev_max - R_prev_min
+                    R_width_curr = R_width_prev * scale
+                    shift_right = shift_left * R_width_prev
+
+                    R_center_prev = (R_prev_min + R_prev_max) / 2
+                    R_center_curr = R_center_prev + shift_right
+
+                    R_new_min = R_center_curr - R_width_curr / 2
+                    R_new_max = R_center_curr + R_width_curr / 2
+
+                    self.right_view_box.setYRange(R_new_min, R_new_max, padding=0)
+                    R_curr = (R_new_min, R_new_max)
+
+            # Update baselines
+            self.L_prev = L_curr
+            self.R_prev = R_curr
+        finally:
+            self._is_syncing = False
+
+    def on_right_y_range_changed(self) -> None:
+        """Update R_prev when the right axis range is changed."""
+        if not getattr(self, "_is_syncing", False):
+            self.R_prev = self.right_view_box.viewRange()[1]
+
+
 
     def _format_number(self, value: Any) -> str:
         """Format numeric values for display in the tree."""
