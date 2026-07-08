@@ -34,7 +34,43 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QTabWidget,
+    QInputDialog,
 )
+
+class AssignmentTabState:
+    """Manages the state of a single channel assignment tab."""
+
+    def __init__(self, name: str, left_series: list[SeriesRef], right_series: list[SeriesRef]):
+        self.name = name
+        # Copy SeriesRefs so they are independent
+        self.left_axis_series = [
+            SeriesRef(
+                source_id=s.source_id,
+                group=s.group,
+                channel=s.channel,
+                series_id=s.series_id,
+                filter_channel=s.filter_channel,
+                filter_value=s.filter_value,
+                color=s.color
+            ) for s in left_series
+        ]
+        self.right_axis_series = [
+            SeriesRef(
+                source_id=s.source_id,
+                group=s.group,
+                channel=s.channel,
+                series_id=s.series_id,
+                filter_channel=s.filter_channel,
+                filter_value=s.filter_value,
+                color=s.color
+            ) for s in right_series
+        ]
+        # Viewport state
+        self.x_range = None
+        self.left_y_range = None
+        self.right_y_range = None
+
 
 import pyqtgraph as pg
 
@@ -234,8 +270,12 @@ class TdmsBrowserWindow(QMainWindow):
             "#2A9D8F",
             "#E76F51",
         ]
-        self.left_axis_series: list[SeriesRef] = []
-        self.right_axis_series: list[SeriesRef] = []
+        self.tabs_state: list[AssignmentTabState] = [
+            AssignmentTabState("Tab 1", [], [])
+        ]
+        self.left_axis_series: list[SeriesRef] = self.tabs_state[0].left_axis_series
+        self.right_axis_series: list[SeriesRef] = self.tabs_state[0].right_axis_series
+        self.active_tab_index = 0
 
         self.plotted_data_cache = []
         self.cursor_items = []
@@ -319,17 +359,93 @@ class TdmsBrowserWindow(QMainWindow):
         self.clear_plot_button = QPushButton("Clear Plot")
         self.clear_plot_button.clicked.connect(self.clear_assignments)
 
-        selection_box = QGroupBox("Channel Assignment")
-        selection_layout = QGridLayout(selection_box)
-        selection_layout.addWidget(self.left_series_list, 1, 0)
-        selection_layout.addWidget(self.right_series_list, 1, 1)
+        # Create container widget for the shared assignment lists and buttons
+        self.container_widget = QWidget()
+        container_layout = QGridLayout(self.container_widget)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(self.left_series_list, 0, 0)
+        container_layout.addWidget(self.right_series_list, 0, 1)
 
         # Button row containing all buttons next to each other
         button_row = QHBoxLayout()
         button_row.addWidget(self.remove_selected_button)
         button_row.addWidget(self.set_batch_filter_button)
         button_row.addWidget(self.clear_plot_button)
-        selection_layout.addLayout(button_row, 2, 0, 1, 2)
+        container_layout.addLayout(button_row, 1, 0, 1, 2)
+
+        # Tab widget creation
+        self.assignment_tabs = QTabWidget()
+        self.assignment_tabs.setTabsClosable(True)
+        self.assignment_tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: none;
+                background: transparent;
+            }
+            QTabBar::tab {
+                background: #f1f1f1;
+                border: 1px solid #dcdcdc;
+                border-bottom: none;
+                padding: 6px 12px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                color: #555555;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                border-color: #b8b8b8;
+                color: #000000;
+            }
+            QTabBar::tab:hover {
+                background: #e5e5e5;
+                color: #000000;
+            }
+        """)
+
+        # Add '+' button in corner
+        self.add_tab_button = QPushButton("+")
+        self.add_tab_button.setCursor(Qt.PointingHandCursor)
+        self.add_tab_button.setToolTip("Add new tab")
+        self.add_tab_button.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                font-weight: bold;
+                font-size: 16px;
+                color: #555555;
+                margin-right: 2px;
+                margin-top: 1px;
+                padding: 3px 8px;
+            }
+            QPushButton:hover {
+                background-color: #e2e2e2;
+                color: #000000;
+                border-radius: 3px;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+            }
+        """)
+        self.add_tab_button.clicked.connect(self.add_assignment_tab)
+        self.assignment_tabs.setCornerWidget(self.add_tab_button, Qt.TopRightCorner)
+
+        # Initial Tab Page
+        initial_page = QWidget()
+        initial_layout = QVBoxLayout(initial_page)
+        initial_layout.setContentsMargins(0, 4, 0, 0)
+        initial_layout.addWidget(self.container_widget)
+        self.assignment_tabs.addTab(initial_page, "Tab 1")
+
+        # Connect signals
+        self.assignment_tabs.currentChanged.connect(self.handle_tab_changed)
+        self.assignment_tabs.tabCloseRequested.connect(self.handle_tab_close)
+        self.assignment_tabs.tabBarDoubleClicked.connect(self.handle_tab_double_clicked)
+
+        selection_box = QGroupBox("Channel Assignment")
+        selection_layout = QVBoxLayout(selection_box)
+        selection_layout.setContentsMargins(4, 4, 4, 4)
+        selection_layout.setSpacing(4)
+        selection_layout.addWidget(self.assignment_tabs)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -665,8 +781,9 @@ class TdmsBrowserWindow(QMainWindow):
 
         self.loaded_sources.clear()
         self.source_order.clear()
-        self.left_axis_series = []
-        self.right_axis_series = []
+        for state in self.tabs_state:
+            state.left_axis_series.clear()
+            state.right_axis_series.clear()
         self.refresh_loaded_sources_view()
         self.refresh_tree()
         self.left_series_list.clear()
@@ -822,8 +939,8 @@ class TdmsBrowserWindow(QMainWindow):
 
     def clear_assignments(self) -> None:
         """Clear both axis assignments and reset the plot."""
-        self.left_axis_series = []
-        self.right_axis_series = []
+        self.left_axis_series.clear()
+        self.right_axis_series.clear()
         self.left_series_list.clear()
         self.right_series_list.clear()
         self.update_plot()
@@ -1015,10 +1132,11 @@ class TdmsBrowserWindow(QMainWindow):
         return base_label
 
     def _prune_plot_state(self) -> None:
-        """Remove series references that point to unloaded sources."""
+        """Remove series references that point to unloaded sources across all tabs."""
         loaded_ids = set(self.loaded_sources)
-        self.left_axis_series = [ref for ref in self.left_axis_series if ref.source_id in loaded_ids]
-        self.right_axis_series = [ref for ref in self.right_axis_series if ref.source_id in loaded_ids]
+        for state in self.tabs_state:
+            state.left_axis_series[:] = [ref for ref in state.left_axis_series if ref.source_id in loaded_ids]
+            state.right_axis_series[:] = [ref for ref in state.right_axis_series if ref.source_id in loaded_ids]
 
     def _color_icon(self, color: str) -> QIcon:
         """Create a small color swatch for list entries."""
@@ -1093,6 +1211,144 @@ class TdmsBrowserWindow(QMainWindow):
         """Update R_prev when the right axis range is changed."""
         if not getattr(self, "_is_syncing", False):
             self.R_prev = self.right_view_box.viewRange()[1]
+
+    def add_assignment_tab(self) -> None:
+        """Create a new assignment tab, inheriting the current tab's settings."""
+        curr_idx = self.assignment_tabs.currentIndex()
+        if 0 <= curr_idx < len(self.tabs_state):
+            curr_state = self.tabs_state[curr_idx]
+            left_copy = curr_state.left_axis_series
+            right_copy = curr_state.right_axis_series
+            # Get current viewport range
+            try:
+                curr_x = self.plot_item.vb.viewRange()[0]
+                curr_ly = self.plot_item.vb.viewRange()[1]
+                curr_ry = self.right_view_box.viewRange()[1]
+            except Exception:
+                curr_x = None
+                curr_ly = None
+                curr_ry = None
+        else:
+            left_copy = []
+            right_copy = []
+            curr_x = None
+            curr_ly = None
+            curr_ry = None
+
+        new_tab_num = 1
+        existing_names = {t.name for t in self.tabs_state}
+        while f"Tab {new_tab_num}" in existing_names:
+            new_tab_num += 1
+        new_name = f"Tab {new_tab_num}"
+
+        # Create tab state
+        new_state = AssignmentTabState(new_name, left_copy, right_copy)
+        new_state.x_range = curr_x
+        new_state.left_y_range = curr_ly
+        new_state.right_y_range = curr_ry
+        self.tabs_state.append(new_state)
+
+        # Create page widget
+        new_page = QWidget()
+        new_layout = QVBoxLayout(new_page)
+        new_layout.setContentsMargins(0, 4, 0, 0)
+
+        # Add page to tab widget
+        self.assignment_tabs.addTab(new_page, new_name)
+        # Select the newly created tab (triggers handle_tab_changed)
+        self.assignment_tabs.setCurrentIndex(self.assignment_tabs.count() - 1)
+
+    def handle_tab_changed(self, index: int) -> None:
+        """Handle switching between assignment tabs."""
+        if index < 0 or index >= len(self.tabs_state):
+            return
+
+        # 1. Save current viewport state to the tab we are switching AWAY from
+        prev_idx = getattr(self, "active_tab_index", 0)
+        if 0 <= prev_idx < len(self.tabs_state):
+            try:
+                prev_state = self.tabs_state[prev_idx]
+                prev_state.x_range = self.plot_item.vb.viewRange()[0]
+                prev_state.left_y_range = self.plot_item.vb.viewRange()[1]
+                prev_state.right_y_range = self.right_view_box.viewRange()[1]
+            except Exception:
+                pass
+
+        # 2. Move the container widget to the active tab's layout
+        active_page = self.assignment_tabs.widget(index)
+        if active_page and active_page.layout():
+            active_page.layout().addWidget(self.container_widget)
+
+        # 3. Update the active lists references
+        state = self.tabs_state[index]
+        self.left_axis_series = state.left_axis_series
+        self.right_axis_series = state.right_axis_series
+
+        # 4. Refresh the UI lists and redraw the plot
+        self._refresh_series_list("left")
+        self._refresh_series_list("right")
+        self.update_plot()
+
+        # 5. Restore viewport state if it exists
+        if state.x_range is not None:
+            self._is_syncing = True
+            try:
+                self.plot_item.vb.setXRange(state.x_range[0], state.x_range[1], padding=0)
+                self.plot_item.vb.setYRange(state.left_y_range[0], state.left_y_range[1], padding=0)
+                self.right_view_box.setYRange(state.right_y_range[0], state.right_y_range[1], padding=0)
+                self.L_prev = state.left_y_range
+                self.R_prev = state.right_y_range
+            finally:
+                self._is_syncing = False
+
+        # 6. Set the new active tab index
+        self.active_tab_index = index
+
+    def handle_tab_close(self, index: int) -> None:
+        """Close the tab at the given index, preserving at least one tab."""
+        if self.assignment_tabs.count() <= 1:
+            QMessageBox.information(self, "Close Tab", "At least one tab must remain active.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Close Tab",
+            f"Are you sure you want to close '{self.tabs_state[index].name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        # Safely disconnect to prevent intermediate range updates
+        self.assignment_tabs.currentChanged.disconnect(self.handle_tab_changed)
+        try:
+            self.assignment_tabs.removeTab(index)
+            self.tabs_state.pop(index)
+        finally:
+            self.assignment_tabs.currentChanged.connect(self.handle_tab_changed)
+
+        # Manually trigger layout shift to the current active tab
+        new_active = self.assignment_tabs.currentIndex()
+        self.handle_tab_changed(new_active)
+
+    def handle_tab_double_clicked(self, index: int) -> None:
+        """Rename the double-clicked tab."""
+        if index < 0 or index >= len(self.tabs_state):
+            return
+
+        current_name = self.tabs_state[index].name
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Tab",
+            "Enter new name for the tab:",
+            QLineEdit.Normal,
+            current_name
+        )
+        if ok and new_name.strip():
+            new_name = new_name.strip()
+            self.tabs_state[index].name = new_name
+            self.assignment_tabs.setTabText(index, new_name)
 
 
 
