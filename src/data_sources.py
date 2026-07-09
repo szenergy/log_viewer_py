@@ -247,63 +247,67 @@ def get_channel_data(
         x_group, x_chan = source.x_channel
         x_raw = _get_raw_channel_data(source, x_group, x_chan)
 
-    # Align X and Y raw data
-    if x_raw is None or len(x_raw) == 0:
-        x_values = np.arange(len(y_raw))
-        y_values = y_raw
-    else:
-        min_len = min(len(x_raw), len(y_raw))
-        x_values = x_raw[:min_len]
-        y_values = y_raw[:min_len]
+    # Determine common raw alignment length
+    min_len = len(y_raw)
+    if x_raw is not None and len(x_raw) > 0:
+        min_len = min(min_len, len(x_raw))
 
-    # Apply prescaler and offset
-    prescaler = getattr(source, "prescaler", 1.0)
-    offset = getattr(source, "offset", 0.0)
-    x_values = (x_values * prescaler) + offset
+    # Optional local filter channel loading
+    f_raw = None
+    if filter_channel is not None:
+        f_group, f_chan = filter_channel
+        f_raw = _get_raw_channel_data(source, f_group, f_chan)
+        if f_raw is not None and len(f_raw) > 0:
+            min_len = min(min_len, len(f_raw))
+
+    # Initialize master mask
+    master_mask = np.ones(min_len, dtype=bool)
+
+    # Extract aligned raw values
+    y_aligned = y_raw[:min_len]
+    if x_raw is None or len(x_raw) == 0:
+        x_aligned = np.arange(min_len)
+    else:
+        x_aligned = x_raw[:min_len]
 
     # Apply limit overrides (outlier filter) for Y channel
     y_limits = getattr(source, "channel_limits", {}).get((group_name, channel_name))
     if y_limits is not None:
         y_min, y_max = y_limits
         if y_min is not None:
-            y_mask = y_values >= y_min
-            x_values = x_values[y_mask]
-            y_values = y_values[y_mask]
+            master_mask &= (y_aligned >= y_min)
         if y_max is not None:
-            y_mask = y_values <= y_max
-            x_values = x_values[y_mask]
-            y_values = y_values[y_mask]
+            master_mask &= (y_aligned <= y_max)
 
-    # Apply limit overrides (outlier filter) for X channel (if custom X channel is used)
+    # Apply limit overrides (outlier filter) for X channel
     if source.x_channel is not None:
         x_limits = getattr(source, "channel_limits", {}).get(source.x_channel)
         if x_limits is not None:
             x_min, x_max = x_limits
             if x_min is not None:
-                x_mask = x_values >= x_min
-                x_values = x_values[x_mask]
-                y_values = y_values[x_mask]
+                master_mask &= (x_aligned >= x_min)
             if x_max is not None:
-                x_mask = x_values <= x_max
-                x_values = x_values[x_mask]
-                y_values = y_values[x_mask]
+                master_mask &= (x_aligned <= x_max)
 
-    # Apply filter if configured
-    if filter_channel is not None:
-        f_group, f_chan = filter_channel
-        f_raw = _get_raw_channel_data(source, f_group, f_chan)
-        if f_raw is not None and len(f_raw) > 0:
-            min_len = min(len(x_values), len(f_raw))
-            x_values = x_values[:min_len]
-            y_values = y_values[:min_len]
-            f_aligned = f_raw[:min_len]
+    # Apply local filter on aligned indices
+    if filter_channel is not None and f_raw is not None and len(f_raw) > 0:
+        f_aligned = f_raw[:min_len]
+        master_mask &= np.isclose(f_aligned, filter_value)
 
-            # Generate filter mask (matching the configured filter value)
-            f_mask = np.isclose(f_aligned, filter_value)
-            x_values = x_values[f_mask]
-            y_values = y_values[f_mask]
+    # Check if we have any valid indices left
+    if not np.any(master_mask):
+        return None
 
-    # Filter invalid/non-numeric values
+    # Filter arrays using the master mask
+    x_values = x_aligned[master_mask]
+    y_values = y_aligned[master_mask]
+
+    # Apply prescaler and offset to the final X-axis
+    prescaler = getattr(source, "prescaler", 1.0)
+    offset = getattr(source, "offset", 0.0)
+    x_values = (x_values * prescaler) + offset
+
+    # Filter invalid/non-numeric values (inf / nan)
     mask = np.isfinite(x_values) & np.isfinite(y_values)
     if not np.any(mask):
         return None
@@ -311,7 +315,7 @@ def get_channel_data(
     x_res = x_values[mask]
     y_res = y_values[mask]
 
-    # Shift X axis so the first remaining point starts at X=0 when filtering is active
+    # Shift X axis so the first remaining point starts at X=0 when local filtering is active
     if filter_channel is not None and len(x_res) > 0:
         x_res = x_res - x_res[0]
 

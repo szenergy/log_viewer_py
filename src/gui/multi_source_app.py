@@ -54,8 +54,10 @@ class ConfiguredStat:
     group: str
     channel: str
     transform: str       # "none", "deriv_raw", "deriv_smooth", "diff"
-    aggregation: str     # "min", "max", "avg", "median", "integral", "net_change"
+    aggregation: str     # "min", "max", "avg", "median", "integral", "net_change", "stddev"
     multiplier: float = 1.0
+    stat_min: Optional[float] = None
+    stat_max: Optional[float] = None
     last_value: Optional[float] = None
 
 
@@ -322,7 +324,7 @@ class AddEditStatDialog(QDialog):
 
     def __init__(
         self,
-        plotted_channels: list[tuple[str, str, str, str]],  # [(tab_name, source_id, group, channel)]
+        plotted_channels: list[tuple[str, str, str]],  # [(source_id, group, channel)]
         loaded_sources: dict[str, LoadedSource],
         existing_stat: Optional[ConfiguredStat] = None,
         parent: Optional[QWidget] = None
@@ -334,64 +336,45 @@ class AddEditStatDialog(QDialog):
 
         title = "Edit Statistic" if existing_stat else "Add Statistic"
         self.setWindowTitle(title)
-        self.resize(450, 250)
+        self.resize(480, 320)
 
         layout = QVBoxLayout(self)
         form_layout = QFormLayout()
 
-        # Label/Name input
-        self.label_input = QLineEdit()
-        self.label_input.setPlaceholderText("Auto-generate from settings")
-        if existing_stat:
-            self.label_input.setText(existing_stat.label)
-        form_layout.addRow("Custom Label:", self.label_input)
-
-        # Channel Selector
+        # 1. Channel Selector
         self.channel_combo = QComboBox()
-        # Populating plotted channels
-        for tab_name, source_id, group, channel in plotted_channels:
+        for source_id, group, channel in plotted_channels:
             source = loaded_sources.get(source_id)
             source_name = source.display_name if source else source_id
-            display_str = f"[{tab_name}] {source_name} / {group} / {channel}"
+            display_str = f"{source_name} / {group} / {channel}"
             role_data = (source_id, group, channel)
             self.channel_combo.addItem(display_str, role_data)
 
-        # Pre-select if editing
         if existing_stat:
             target_role = (existing_stat.source_id, existing_stat.group, existing_stat.channel)
             for i in range(self.channel_combo.count()):
                 if self.channel_combo.itemData(i) == target_role:
                     self.channel_combo.setCurrentIndex(i)
                     break
-        form_layout.addRow("Channel:", self.channel_combo)
+        form_layout.addRow("1. Channel:", self.channel_combo)
 
-        # Transformation Selector
-        self.transform_combo = QComboBox()
-        self.transform_combo.addItem("None (Raw Values)", "none")
-        self.transform_combo.addItem("Derivative (dY/dX) - Raw", "deriv_raw")
-        self.transform_combo.addItem("Derivative (dY/dX) - Smoothed (5-pt SMA)", "deriv_smooth")
-        self.transform_combo.addItem("Difference (dY)", "diff")
+        # Pre-processing Section Header
+        preprocess_label = QLabel("2. Pre-processing")
+        form_layout.addRow(preprocess_label)
 
-        if existing_stat:
-            idx = self.transform_combo.findData(existing_stat.transform)
-            if idx != -1:
-                self.transform_combo.setCurrentIndex(idx)
-        form_layout.addRow("Transformation:", self.transform_combo)
+        # Min Filter
+        self.min_filter_input = QLineEdit()
+        self.min_filter_input.setPlaceholderText("No minimum filter")
+        if existing_stat and existing_stat.stat_min is not None:
+            self.min_filter_input.setText(str(existing_stat.stat_min))
+        form_layout.addRow("   Min Filter:", self.min_filter_input)
 
-        # Aggregation Selector
-        self.aggregation_combo = QComboBox()
-        self.aggregation_combo.addItem("Minimum (Min)", "min")
-        self.aggregation_combo.addItem("Maximum (Max)", "max")
-        self.aggregation_combo.addItem("Average (Mean)", "avg")
-        self.aggregation_combo.addItem("Median", "median")
-        self.aggregation_combo.addItem("Integral (Trapezoidal)", "integral")
-        self.aggregation_combo.addItem("Net Change", "net_change")
-
-        if existing_stat:
-            idx = self.aggregation_combo.findData(existing_stat.aggregation)
-            if idx != -1:
-                self.aggregation_combo.setCurrentIndex(idx)
-        form_layout.addRow("Aggregation:", self.aggregation_combo)
+        # Max Filter
+        self.max_filter_input = QLineEdit()
+        self.max_filter_input.setPlaceholderText("No maximum filter")
+        if existing_stat and existing_stat.stat_max is not None:
+            self.max_filter_input.setText(str(existing_stat.stat_max))
+        form_layout.addRow("   Max Filter:", self.max_filter_input)
 
         # Multiplier
         self.multiplier_spin = QDoubleSpinBox()
@@ -402,7 +385,43 @@ class AddEditStatDialog(QDialog):
             self.multiplier_spin.setValue(existing_stat.multiplier)
         else:
             self.multiplier_spin.setValue(1.0)
-        form_layout.addRow("Multiplier:", self.multiplier_spin)
+        form_layout.addRow("   Multiplier:", self.multiplier_spin)
+
+        # 3. Transformation Selector
+        self.transform_combo = QComboBox()
+        self.transform_combo.addItem("None (Raw Values)", "none")
+        self.transform_combo.addItem("Derivative (dY/dX) - Raw", "deriv_raw")
+        self.transform_combo.addItem("Derivative (dY/dX) - Smoothed (5-pt SMA)", "deriv_smooth")
+        self.transform_combo.addItem("Difference (dY)", "diff")
+
+        if existing_stat:
+            idx = self.transform_combo.findData(existing_stat.transform)
+            if idx != -1:
+                self.transform_combo.setCurrentIndex(idx)
+        form_layout.addRow("3. Transformation:", self.transform_combo)
+
+        # 4. Aggregation Selector
+        self.aggregation_combo = QComboBox()
+        self.aggregation_combo.addItem("Minimum", "min")
+        self.aggregation_combo.addItem("Maximum", "max")
+        self.aggregation_combo.addItem("Average", "avg")
+        self.aggregation_combo.addItem("Median", "median")
+        self.aggregation_combo.addItem("Integral", "integral")
+        self.aggregation_combo.addItem("Net Change", "net_change")
+        self.aggregation_combo.addItem("Standard Deviation", "stddev")
+
+        if existing_stat:
+            idx = self.aggregation_combo.findData(existing_stat.aggregation)
+            if idx != -1:
+                self.aggregation_combo.setCurrentIndex(idx)
+        form_layout.addRow("4. Aggregation:", self.aggregation_combo)
+
+        # Custom Label
+        self.label_input = QLineEdit()
+        self.label_input.setPlaceholderText("Auto-generated from settings")
+        if existing_stat:
+            self.label_input.setText(existing_stat.label)
+        form_layout.addRow("Custom Label:", self.label_input)
 
         layout.addLayout(form_layout)
 
@@ -426,6 +445,30 @@ class AddEditStatDialog(QDialog):
         source_id, group, channel = self.channel_combo.currentData()
         transform = self.transform_combo.currentData()
         aggregation = self.aggregation_combo.currentData()
+        multiplier = self.multiplier_spin.value()
+
+        # Parse min/max filters
+        min_text = self.min_filter_input.text().strip()
+        stat_min = None
+        if min_text:
+            try:
+                stat_min = float(min_text)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Input", "Min Filter must be a valid number or empty.")
+                return
+
+        max_text = self.max_filter_input.text().strip()
+        stat_max = None
+        if max_text:
+            try:
+                stat_max = float(max_text)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Input", "Max Filter must be a valid number or empty.")
+                return
+
+        if stat_min is not None and stat_max is not None and stat_min > stat_max:
+            QMessageBox.warning(self, "Invalid Input", "Min Filter cannot be greater than Max Filter.")
+            return
 
         label = self.label_input.text().strip()
         if not label:
@@ -439,9 +482,20 @@ class AddEditStatDialog(QDialog):
                 trans_name = "smoothed d/dx "
             elif transform == "diff":
                 trans_name = "diff "
-            label = f"{agg_name} of {trans_name}{channel} ({source_name})"
-
-        multiplier = self.multiplier_spin.value()
+            
+            label = f"{agg_name} of {trans_name}{channel}"
+            
+            filter_parts = []
+            if stat_min is not None:
+                filter_parts.append(f">{stat_min}")
+            if stat_max is not None:
+                filter_parts.append(f"<{stat_max}")
+            if multiplier != 1.0:
+                filter_parts.append(f"x{multiplier:.6g}")
+            
+            if filter_parts:
+                label += f" ({', '.join(filter_parts)})"
+            label += f" ({source_name})"
 
         import uuid
         stat_id = self.existing_stat.stat_id if self.existing_stat else uuid.uuid4().hex[:8]
@@ -456,6 +510,8 @@ class AddEditStatDialog(QDialog):
             transform=transform,
             aggregation=aggregation,
             multiplier=multiplier,
+            stat_min=stat_min,
+            stat_max=stat_max,
             last_value=last_val
         )
         self.accept()
@@ -599,16 +655,16 @@ class TdmsBrowserWindow(QMainWindow):
         )
         self.cursor_tooltip.hide()
 
-        self.open_button = QPushButton("Load Files")
+        self.open_button = QPushButton("Load")
         self.open_button.clicked.connect(self.open_file_dialog)
 
         self.loaded_sources_list = QListWidget()
         self.loaded_sources_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.loaded_sources_list.itemDoubleClicked.connect(self.configure_source_by_item)
 
-        self.unload_selected_button = QPushButton("Unload Selected")
+        self.unload_selected_button = QPushButton("Unload")
         self.unload_selected_button.clicked.connect(self.unload_selected_sources)
-        self.clear_loaded_button = QPushButton("Clear All")
+        self.clear_loaded_button = QPushButton("Clear")
         self.clear_loaded_button.clicked.connect(self.clear_loaded_sources)
 
         loaded_box = QGroupBox("Loaded Files")
@@ -652,15 +708,15 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_series_list.itemDoubleClicked.connect(lambda item: self.configure_series_by_item(item, "left"))
         self.right_series_list.itemDoubleClicked.connect(lambda item: self.configure_series_by_item(item, "right"))
 
-        self.assign_left_button = QPushButton("Add Selected To Left")
+        self.assign_left_button = QPushButton("Add to the Left")
         self.assign_left_button.clicked.connect(self.add_selected_to_left)
-        self.assign_right_button = QPushButton("Add Selected To Right")
+        self.assign_right_button = QPushButton("Add to the Right")
         self.assign_right_button.clicked.connect(self.add_selected_to_right)
-        self.remove_selected_button = QPushButton("Remove Selected")
+        self.remove_selected_button = QPushButton("Remove")
         self.remove_selected_button.clicked.connect(self.remove_selected_from_plot)
-        self.set_batch_filter_button = QPushButton("Set Filter for Selected")
+        self.set_batch_filter_button = QPushButton("Set Filter")
         self.set_batch_filter_button.clicked.connect(self.set_filter_for_selected)
-        self.clear_plot_button = QPushButton("Clear Plot")
+        self.clear_plot_button = QPushButton("Clear")
         self.clear_plot_button.clicked.connect(self.clear_assignments)
 
         # Create container widget for the shared assignment lists and buttons
@@ -1731,14 +1787,13 @@ class TdmsBrowserWindow(QMainWindow):
                 self.configured_stats.pop(row)
             self.recalculate_statistics()
 
-    def _get_all_plotted_channels(self) -> list[tuple[str, str, str, str]]:
-        """Return a list of all currently plotted channels across all tabs."""
+    def _get_all_plotted_channels(self) -> list[tuple[str, str, str]]:
+        """Return a list of all unique currently plotted channels across all tabs."""
         plotted = []
         seen = set()
         for state in self.tabs_state:
-            tab_name = state.name
             for ref in state.left_axis_series + state.right_axis_series:
-                key = (tab_name, ref.source_id, ref.group, ref.channel)
+                key = (ref.source_id, ref.group, ref.channel)
                 if key not in seen:
                     plotted.append(key)
                     seen.add(key)
@@ -1779,12 +1834,28 @@ class TdmsBrowserWindow(QMainWindow):
                     y_vis = y_full[visible_mask]
 
                     if len(x_vis) > 0:
-                        # Apply pre-processing constant multiplier before anything else
-                        multiplier = getattr(stat, "multiplier", 1.0)
-                        y_vis = y_vis * multiplier
+                        # 1. Apply pre-processing min/max filters before the multiplier
+                        stat_min = getattr(stat, "stat_min", None)
+                        stat_max = getattr(stat, "stat_max", None)
 
-                        x_t, y_t = x_vis, y_vis
-                        valid_calc = True
+                        prep_mask = np.ones(len(y_vis), dtype=bool)
+                        if stat_min is not None:
+                            prep_mask &= (y_vis >= stat_min)
+                        if stat_max is not None:
+                            prep_mask &= (y_vis <= stat_max)
+
+                        x_vis = x_vis[prep_mask]
+                        y_vis = y_vis[prep_mask]
+
+                        if len(x_vis) > 0:
+                            # 2. Apply pre-processing constant multiplier
+                            multiplier = getattr(stat, "multiplier", 1.0)
+                            y_vis = y_vis * multiplier
+
+                            x_t, y_t = x_vis, y_vis
+                            valid_calc = True
+                        else:
+                            valid_calc = False
 
                         if stat.transform == "deriv_raw":
                             if len(x_vis) >= 2:
@@ -1846,6 +1917,8 @@ class TdmsBrowserWindow(QMainWindow):
                                         computed_val = 0.0
                                 elif stat.aggregation == "net_change":
                                     computed_val = float(y_t[-1] - y_t[0])
+                                elif stat.aggregation == "stddev":
+                                    computed_val = float(np.std(y_t))
                             except Exception:
                                 computed_val = None
 
