@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -26,6 +26,7 @@ class LoadedSource:
     prescaler: float = 1.0
     offset: float = 0.0
     x_channel: Optional[tuple[str, str]] = None  # (group_name, channel_name)
+    channel_limits: Dict[tuple[str, str], tuple[Optional[float], Optional[float]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -259,6 +260,33 @@ def get_channel_data(
     prescaler = getattr(source, "prescaler", 1.0)
     offset = getattr(source, "offset", 0.0)
     x_values = (x_values * prescaler) + offset
+
+    # Apply limit overrides (outlier filter) for Y channel
+    y_limits = getattr(source, "channel_limits", {}).get((group_name, channel_name))
+    if y_limits is not None:
+        y_min, y_max = y_limits
+        if y_min is not None:
+            y_mask = y_values >= y_min
+            x_values = x_values[y_mask]
+            y_values = y_values[y_mask]
+        if y_max is not None:
+            y_mask = y_values <= y_max
+            x_values = x_values[y_mask]
+            y_values = y_values[y_mask]
+
+    # Apply limit overrides (outlier filter) for X channel (if custom X channel is used)
+    if source.x_channel is not None:
+        x_limits = getattr(source, "channel_limits", {}).get(source.x_channel)
+        if x_limits is not None:
+            x_min, x_max = x_limits
+            if x_min is not None:
+                x_mask = x_values >= x_min
+                x_values = x_values[x_mask]
+                y_values = y_values[x_mask]
+            if x_max is not None:
+                x_mask = x_values <= x_max
+                x_values = x_values[x_mask]
+                y_values = y_values[x_mask]
 
     # Apply filter if configured
     if filter_channel is not None:

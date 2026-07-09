@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 import sys
 from typing import Any, Dict, Optional
+from dataclasses import dataclass
+import uuid
 
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QIcon, QPainter, QPixmap
+from PySide6.QtGui import QIcon, QPainter, QPixmap, QPen, QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -36,7 +38,26 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QTabWidget,
     QInputDialog,
+    QGraphicsRectItem,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
 )
+
+@dataclass
+class ConfiguredStat:
+    """Represents a user-defined statistic calculation."""
+    stat_id: str
+    label: str
+    source_id: str
+    group: str
+    channel: str
+    transform: str       # "none", "deriv_raw", "deriv_smooth", "diff"
+    aggregation: str     # "min", "max", "avg", "median", "integral", "net_change"
+    multiplier: float = 1.0
+    last_value: Optional[float] = None
+
 
 class AssignmentTabState:
     """Manages the state of a single channel assignment tab."""
@@ -221,6 +242,237 @@ class SeriesConfigDialog(QDialog):
         )
 
 
+class ChannelLimitDialog(QDialog):
+    """Modal dialog to configure a channel's min and max cutoff limits."""
+
+    def __init__(self, display_name: str, current_min: Optional[float], current_max: Optional[float], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Configure Channel Limits")
+        self.resize(400, 160)
+
+        layout = QVBoxLayout(self)
+
+        form_layout = QFormLayout()
+        form_layout.addRow(QLabel(f"Channel: {display_name}"))
+
+        # Min cutoff
+        self.min_input = QLineEdit()
+        self.min_input.setPlaceholderText("No lower limit (None)")
+        if current_min is not None:
+            self.min_input.setText(str(current_min))
+        form_layout.addRow("Min Value Cutoff:", self.min_input)
+
+        # Max cutoff
+        self.max_input = QLineEdit()
+        self.max_input.setPlaceholderText("No upper limit (None)")
+        if current_max is not None:
+            self.max_input.setText(str(current_max))
+        form_layout.addRow("Max Value Cutoff:", self.max_input)
+
+        layout.addLayout(form_layout)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(self.validate_and_accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        self.parsed_min = None
+        self.parsed_max = None
+
+    def validate_and_accept(self) -> None:
+        min_val = None
+        max_val = None
+
+        min_str = self.min_input.text().strip()
+        max_str = self.max_input.text().strip()
+
+        if min_str:
+            try:
+                min_val = float(min_str)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Value", "Min cutoff must be a number or empty.")
+                return
+
+        if max_str:
+            try:
+                max_val = float(max_str)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Value", "Max cutoff must be a number or empty.")
+                return
+
+        if min_val is not None and max_val is not None and min_val > max_val:
+            QMessageBox.warning(self, "Invalid Limits", "Min cutoff cannot be greater than Max cutoff.")
+            return
+
+        self.parsed_min = min_val
+        self.parsed_max = max_val
+        self.accept()
+
+    def get_settings(self) -> tuple[Optional[float], Optional[float]]:
+        return self.parsed_min, self.parsed_max
+
+
+class AddEditStatDialog(QDialog):
+    """Dialog to create or edit a global statistic metric."""
+
+    def __init__(
+        self,
+        plotted_channels: list[tuple[str, str, str, str]],  # [(tab_name, source_id, group, channel)]
+        loaded_sources: dict[str, LoadedSource],
+        existing_stat: Optional[ConfiguredStat] = None,
+        parent: Optional[QWidget] = None
+    ) -> None:
+        super().__init__(parent)
+        self.plotted_channels = plotted_channels
+        self.loaded_sources = loaded_sources
+        self.existing_stat = existing_stat
+
+        title = "Edit Statistic" if existing_stat else "Add Statistic"
+        self.setWindowTitle(title)
+        self.resize(450, 250)
+
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        # Label/Name input
+        self.label_input = QLineEdit()
+        self.label_input.setPlaceholderText("Auto-generate from settings")
+        if existing_stat:
+            self.label_input.setText(existing_stat.label)
+        form_layout.addRow("Custom Label:", self.label_input)
+
+        # Channel Selector
+        self.channel_combo = QComboBox()
+        # Populating plotted channels
+        for tab_name, source_id, group, channel in plotted_channels:
+            source = loaded_sources.get(source_id)
+            source_name = source.display_name if source else source_id
+            display_str = f"[{tab_name}] {source_name} / {group} / {channel}"
+            role_data = (source_id, group, channel)
+            self.channel_combo.addItem(display_str, role_data)
+
+        # Pre-select if editing
+        if existing_stat:
+            target_role = (existing_stat.source_id, existing_stat.group, existing_stat.channel)
+            for i in range(self.channel_combo.count()):
+                if self.channel_combo.itemData(i) == target_role:
+                    self.channel_combo.setCurrentIndex(i)
+                    break
+        form_layout.addRow("Channel:", self.channel_combo)
+
+        # Transformation Selector
+        self.transform_combo = QComboBox()
+        self.transform_combo.addItem("None (Raw Values)", "none")
+        self.transform_combo.addItem("Derivative (dY/dX) - Raw", "deriv_raw")
+        self.transform_combo.addItem("Derivative (dY/dX) - Smoothed (5-pt SMA)", "deriv_smooth")
+        self.transform_combo.addItem("Difference (dY)", "diff")
+
+        if existing_stat:
+            idx = self.transform_combo.findData(existing_stat.transform)
+            if idx != -1:
+                self.transform_combo.setCurrentIndex(idx)
+        form_layout.addRow("Transformation:", self.transform_combo)
+
+        # Aggregation Selector
+        self.aggregation_combo = QComboBox()
+        self.aggregation_combo.addItem("Minimum (Min)", "min")
+        self.aggregation_combo.addItem("Maximum (Max)", "max")
+        self.aggregation_combo.addItem("Average (Mean)", "avg")
+        self.aggregation_combo.addItem("Median", "median")
+        self.aggregation_combo.addItem("Integral (Trapezoidal)", "integral")
+        self.aggregation_combo.addItem("Net Change", "net_change")
+
+        if existing_stat:
+            idx = self.aggregation_combo.findData(existing_stat.aggregation)
+            if idx != -1:
+                self.aggregation_combo.setCurrentIndex(idx)
+        form_layout.addRow("Aggregation:", self.aggregation_combo)
+
+        # Multiplier
+        self.multiplier_spin = QDoubleSpinBox()
+        self.multiplier_spin.setRange(-1000000000.0, 1000000000.0)
+        self.multiplier_spin.setDecimals(6)
+        self.multiplier_spin.setSingleStep(1.0)
+        if existing_stat:
+            self.multiplier_spin.setValue(existing_stat.multiplier)
+        else:
+            self.multiplier_spin.setValue(1.0)
+        form_layout.addRow("Multiplier:", self.multiplier_spin)
+
+        layout.addLayout(form_layout)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(self.validate_and_accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        self.result_stat = None
+
+    def validate_and_accept(self) -> None:
+        if self.channel_combo.count() == 0:
+            QMessageBox.warning(self, "No Channels Available", "There are no plotted channels to calculate statistics on.")
+            return
+
+        source_id, group, channel = self.channel_combo.currentData()
+        transform = self.transform_combo.currentData()
+        aggregation = self.aggregation_combo.currentData()
+
+        label = self.label_input.text().strip()
+        if not label:
+            source = self.loaded_sources.get(source_id)
+            source_name = source.display_name if source else "Source"
+            agg_name = self.aggregation_combo.currentText().split(" ")[0]
+            trans_name = ""
+            if transform == "deriv_raw":
+                trans_name = "d/dx "
+            elif transform == "deriv_smooth":
+                trans_name = "smoothed d/dx "
+            elif transform == "diff":
+                trans_name = "diff "
+            label = f"{agg_name} of {trans_name}{channel} ({source_name})"
+
+        multiplier = self.multiplier_spin.value()
+
+        import uuid
+        stat_id = self.existing_stat.stat_id if self.existing_stat else uuid.uuid4().hex[:8]
+        last_val = self.existing_stat.last_value if self.existing_stat else None
+
+        self.result_stat = ConfiguredStat(
+            stat_id=stat_id,
+            label=label,
+            source_id=source_id,
+            group=group,
+            channel=channel,
+            transform=transform,
+            aggregation=aggregation,
+            multiplier=multiplier,
+            last_value=last_val
+        )
+        self.accept()
+
+    def get_stat(self) -> Optional[ConfiguredStat]:
+        return self.result_stat
+
+
+class CustomTableWidget(QTableWidget):
+    """Custom QTableWidget that allows clearing selection when clicking empty space."""
+    def mousePressEvent(self, event) -> None:
+        item = self.itemAt(event.pos())
+        if item is None:
+            self.clearSelection()
+        super().mousePressEvent(event)
+
+
 
 class FileLoaderThread(QThread):
     """Background worker thread to load files without blocking the GUI."""
@@ -251,6 +503,55 @@ class FileLoaderThread(QThread):
         self.finished_loading.emit()
 
 
+class XZoomViewBox(pg.ViewBox):
+    """Custom ViewBox supporting X-axis drag-to-zoom using the left mouse button."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.x_zoom_rect = None
+
+    def mouseDragEvent(self, ev: Any) -> None:
+        # Left button drag triggers custom X-axis zoom (holding Shift falls back to standard panning)
+        if ev.button() == Qt.LeftButton and not (ev.modifiers() & Qt.ShiftModifier):
+            ev.accept()
+
+            if self.x_zoom_rect is None:
+                self.x_zoom_rect = QGraphicsRectItem(self)
+                # Translucent light blue fill with a dodger blue border
+                self.x_zoom_rect.setBrush(QBrush(QColor(135, 206, 250, 80)))
+                self.x_zoom_rect.setPen(QPen(QColor(30, 144, 255), 1))
+                self.x_zoom_rect.hide()
+
+            if ev.isStart():
+                self.x_zoom_rect.show()
+
+            # Map scene points to local coordinate space of this ViewBox
+            start_local = self.mapFromScene(ev.buttonDownScenePos())
+            current_local = self.mapFromScene(ev.scenePos())
+
+            rect = self.boundingRect()
+            x_min = min(start_local.x(), current_local.x())
+            x_max = max(start_local.x(), current_local.x())
+            y_min = rect.top()
+            y_max = rect.bottom()
+
+            self.x_zoom_rect.setRect(x_min, y_min, x_max - x_min, y_max - y_min)
+
+            if ev.isFinish():
+                self.x_zoom_rect.hide()
+                # Check that the drag distance is meaningful to avoid zooming on clicks
+                if abs(current_local.x() - start_local.x()) > 5:
+                    start_view = self.mapSceneToView(ev.buttonDownScenePos())
+                    current_view = self.mapSceneToView(ev.scenePos())
+                    
+                    x_start_val = start_view.x()
+                    x_finish_val = current_view.x()
+                    
+                    self.setXRange(min(x_start_val, x_finish_val), max(x_start_val, x_finish_val), padding=0)
+        else:
+            super().mouseDragEvent(ev)
+
+
 class TdmsBrowserWindow(QMainWindow):
     """Main window for browsing and comparing multiple sources."""
 
@@ -276,6 +577,8 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_axis_series: list[SeriesRef] = self.tabs_state[0].left_axis_series
         self.right_axis_series: list[SeriesRef] = self.tabs_state[0].right_axis_series
         self.active_tab_index = 0
+
+        self.configured_stats: list[ConfiguredStat] = []
 
         self.plotted_data_cache = []
         self.cursor_items = []
@@ -325,7 +628,7 @@ class TdmsBrowserWindow(QMainWindow):
 
         self.plot_widget = pg.GraphicsLayoutWidget()
         self.plot_widget.setBackground("w")
-        self.plot_item = self.plot_widget.addPlot(row=0, col=0)
+        self.plot_item = self.plot_widget.addPlot(row=0, col=0, viewBox=XZoomViewBox())
         self.plot_item.showGrid(x=True, y=True, alpha=0.25)
 
         self.right_view_box = pg.ViewBox()
@@ -340,6 +643,7 @@ class TdmsBrowserWindow(QMainWindow):
         # Cursor line addition and interaction
         self.plot_item.addItem(self.v_line, ignoreBounds=True)
         self.plot_item.scene().sigMouseMoved.connect(self.mouse_moved)
+        self.plot_item.sigXRangeChanged.connect(self.recalculate_statistics)
 
         self.left_series_list = QListWidget()
         self.right_series_list = QListWidget()
@@ -459,15 +763,101 @@ class TdmsBrowserWindow(QMainWindow):
         tree_layout.addWidget(self.assign_left_button)
         tree_layout.addWidget(self.assign_right_button)
 
-        splitter = QSplitter()
-        splitter.addWidget(tree_panel)
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        # Create collapsible sidebar container (starts collapsed)
+        self.sidebar_container = QWidget()
+        sidebar_layout = QHBoxLayout(self.sidebar_container)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
+
+        # Toggle button
+        self.sidebar_toggle_btn = QPushButton("◀")
+        self.sidebar_toggle_btn.setFixedWidth(16)
+        self.sidebar_toggle_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.sidebar_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.sidebar_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f1f1f1;
+                border: 1px solid #dcdcdc;
+                border-top: none;
+                border-bottom: none;
+                color: #555555;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #e5e5e5;
+                color: #000000;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+            }
+        """)
+        self.sidebar_toggle_btn.clicked.connect(self.toggle_sidebar)
+        sidebar_layout.addWidget(self.sidebar_toggle_btn)
+
+        # Sidebar content panel
+        self.sidebar_content = QWidget()
+        self.sidebar_content.setObjectName("sidebar_content_widget")
+        self.sidebar_content.setStyleSheet("QWidget#sidebar_content_widget { background-color: #ffffff; border-left: 1px solid #dcdcdc; }")
+        sidebar_content_layout = QVBoxLayout(self.sidebar_content)
+        sidebar_content_layout.setContentsMargins(4, 4, 4, 4)
+        sidebar_content_layout.setSpacing(4)
+
+        # Title
+        sidebar_title = QLabel("Statistics")
+        sidebar_title.setStyleSheet("font-size: 14px; color: #333333; margin-bottom: 4px;")
+        sidebar_content_layout.addWidget(sidebar_title)
+
+        # Stats Table
+        self.stats_table = CustomTableWidget(0, 2)
+        self.stats_table.setHorizontalHeaderLabels(["Metric", "Value"])
+        self.stats_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.stats_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.stats_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.stats_table.setAlternatingRowColors(True)
+        self.stats_table.setWordWrap(False) # Disable wrapping to prevent word-boundary clipping of hidden lines
+        self.stats_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel) # Enable smooth horizontal scrolling
+        self.stats_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel) # Enable smooth vertical scrolling
+        self.stats_table.horizontalHeader().setStretchLastSection(True)
+        self.stats_table.horizontalHeader().setHighlightSections(False) # Stop headers from turning bold on selection
+        self.stats_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.stats_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.stats_table.setColumnWidth(0, 180)
+        self.stats_table.setColumnWidth(1, 80)
+        self.stats_table.setTextElideMode(Qt.ElideNone) # Clip text character-by-character without aggressive ... elision
+        self.stats_table.verticalHeader().hide() # Remove the index numbers column
+        self.stats_table.itemDoubleClicked.connect(self.edit_selected_stat)
+        sidebar_content_layout.addWidget(self.stats_table, 1)
+
+        # Buttons layout
+        stats_btn_layout = QHBoxLayout()
+        self.add_stat_btn = QPushButton("Add")
+        self.add_stat_btn.clicked.connect(self.add_new_stat)
+        self.delete_stat_btn = QPushButton("Delete")
+        self.delete_stat_btn.clicked.connect(self.delete_selected_stat)
+
+        stats_btn_layout.addWidget(self.add_stat_btn)
+        stats_btn_layout.addWidget(self.delete_stat_btn)
+        sidebar_content_layout.addLayout(stats_btn_layout)
+
+        sidebar_layout.addWidget(self.sidebar_content)
+        self.sidebar_content.hide() # Collapsed by default
+        self.sidebar_container.setFixedWidth(16)
+
+        self.main_splitter = QSplitter()
+        self.main_splitter.addWidget(tree_panel)
+        self.main_splitter.addWidget(right_panel)
+        self.main_splitter.addWidget(self.sidebar_container)
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 5)
+        self.main_splitter.setStretchFactor(2, 2)
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setCollapsible(1, False)
+        self.main_splitter.setCollapsible(2, False)
 
         central_widget = QWidget()
         central_layout = QVBoxLayout(central_widget)
-        central_layout.addWidget(splitter, 1)
+        central_layout.addWidget(self.main_splitter, 1)
         self.setCentralWidget(central_widget)
 
     def _open_native_file_dialog(self) -> Optional[list[str]]:
@@ -655,27 +1045,55 @@ class TdmsBrowserWindow(QMainWindow):
             self.update_plot()
 
     def configure_source_by_tree_item(self, item: QTreeWidgetItem, column: int) -> None:
-        """Open the configuration dialog for a loaded file when double-clicked in the tree."""
+        """Open the configuration dialog for a loaded file or channel when double-clicked in the tree."""
         payload = item.data(0, Qt.UserRole)
-        if not isinstance(payload, dict) or payload.get("type") != "source":
-            return
-        source_id = payload.get("source_id")
-        if not source_id:
-            return
-        source = self.loaded_sources.get(str(source_id))
-        if source is None:
+        if not isinstance(payload, dict):
             return
 
-        dialog = FileConfigDialog(source, self)
-        if dialog.exec() == QDialog.Accepted:
-            prescaler, offset, x_chan = dialog.get_settings()
-            source.prescaler = prescaler
-            source.offset = offset
-            source.x_channel = x_chan
+        if payload.get("type") == "source":
+            source_id = payload.get("source_id")
+            if not source_id:
+                return
+            source = self.loaded_sources.get(str(source_id))
+            if source is None:
+                return
 
-            self.refresh_loaded_sources_view()
-            self.refresh_tree()
-            self.update_plot()
+            dialog = FileConfigDialog(source, self)
+            if dialog.exec() == QDialog.Accepted:
+                prescaler, offset, x_chan = dialog.get_settings()
+                source.prescaler = prescaler
+                source.offset = offset
+                source.x_channel = x_chan
+
+                self.refresh_loaded_sources_view()
+                self.refresh_tree()
+                self.update_plot()
+
+        elif "source_id" in payload and "group" in payload and "channel" in payload:
+            source_id = payload["source_id"]
+            group_name = payload["group"]
+            channel_name = payload["channel"]
+
+            source = self.loaded_sources.get(str(source_id))
+            if source is None:
+                return
+
+            # Retrieve current custom limit overrides for this channel
+            limits = getattr(source, "channel_limits", {}).get((group_name, channel_name))
+            curr_min, curr_max = (None, None) if limits is None else limits
+
+            display_name = f"{source.display_name} / {group_name} / {channel_name}"
+            dialog = ChannelLimitDialog(display_name, curr_min, curr_max, self)
+            if dialog.exec() == QDialog.Accepted:
+                new_min, new_max = dialog.get_settings()
+                if new_min is None and new_max is None:
+                    # Clear override if both are empty
+                    source.channel_limits.pop((group_name, channel_name), None)
+                else:
+                    source.channel_limits[(group_name, channel_name)] = (new_min, new_max)
+
+                self.refresh_tree()
+                self.update_plot()
 
     def configure_series_by_item(self, item: QListWidgetItem, axis: str) -> None:
         """Open the configuration dialog for a plotted channel when double-clicked."""
@@ -824,8 +1242,19 @@ class TdmsBrowserWindow(QMainWindow):
 
                 for channel in group.get("channels", []):
                     channel_name = channel.get("name", "Unnamed Channel")
-                    min_value = self._format_number(channel.get("min"))
-                    max_value = self._format_number(channel.get("max"))
+                    
+                    # Check for limits override
+                    limits = getattr(source, "channel_limits", {}).get((group_name, channel_name))
+                    if limits is not None:
+                        lim_min, lim_max = limits
+                        min_val = lim_min if lim_min is not None else channel.get("min")
+                        max_val = lim_max if lim_max is not None else channel.get("max")
+                    else:
+                        min_val = channel.get("min")
+                        max_val = channel.get("max")
+
+                    min_value = self._format_number(min_val)
+                    max_value = self._format_number(max_val)
                     channel_item = QTreeWidgetItem([channel_name, min_value, max_value])
                     channel_item.setData(
                         0,
@@ -1043,6 +1472,7 @@ class TdmsBrowserWindow(QMainWindow):
         # Update baseline ranges for synchronized zooming
         self.L_prev = self.plot_item.vb.viewRange()[1]
         self.R_prev = self.right_view_box.viewRange()[1]
+        self.recalculate_statistics()
         # else:
         #     self.plot_item.getAxis("right").setLabel("Right axis")
 
@@ -1212,7 +1642,231 @@ class TdmsBrowserWindow(QMainWindow):
         if not getattr(self, "_is_syncing", False):
             self.R_prev = self.right_view_box.viewRange()[1]
 
+    def toggle_sidebar(self) -> None:
+        """Collapse or expand the right statistics sidebar."""
+        is_visible = self.sidebar_content.isVisible()
+        if is_visible:
+            # Save the current width of the sidebar before collapsing so we can restore it
+            self._sidebar_last_width = self.sidebar_container.width()
+            self.sidebar_content.hide()
+            self.sidebar_toggle_btn.setText("◀")
+            # Lock the sidebar container width to 16px (collapsed state)
+            self.sidebar_container.setFixedWidth(16)
+            # Update splitter sizes so the collapsed sidebar is tight (only 16px)
+            sizes = self.main_splitter.sizes()
+            if len(sizes) == 3:
+                # Give the collapsed space back to the middle panel
+                sizes[1] += sizes[2] - 16
+                sizes[2] = 16
+                self.main_splitter.setSizes(sizes)
+        else:
+            # Unlock the sidebar container width with a minimum size of 166px (150px content + 16px button)
+            self.sidebar_container.setMinimumWidth(166)
+            self.sidebar_container.setMaximumWidth(16777215) # QWIDGETSIZE_MAX
+
+            self.sidebar_content.show()
+            self.sidebar_toggle_btn.setText("▶")
+            # Restore to previous width, or default to a reasonable width (similar to tree view)
+            sizes = self.main_splitter.sizes()
+            if len(sizes) == 3:
+                restore_width = getattr(self, "_sidebar_last_width", 250)
+                if restore_width < 100:
+                    restore_width = 250
+                # Take space from the middle panel to expand the sidebar
+                sizes[1] = max(200, sizes[1] - (restore_width - 16))
+                sizes[2] = restore_width
+                self.main_splitter.setSizes(sizes)
+
+    def add_new_stat(self) -> None:
+        """Open the dialog to add a new statistic."""
+        plotted = self._get_all_plotted_channels()
+        if not plotted:
+            QMessageBox.information(self, "No Plotted Channels", "Please plot at least one channel in any tab before adding statistics.")
+            return
+
+        dialog = AddEditStatDialog(plotted, self.loaded_sources, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            new_stat = dialog.get_stat()
+            if new_stat:
+                self.configured_stats.append(new_stat)
+                self.recalculate_statistics()
+
+    def edit_selected_stat(self, item: QTableWidgetItem) -> None:
+        """Open the dialog to edit the double-clicked statistic."""
+        row = item.row()
+        if not (0 <= row < len(self.configured_stats)):
+            return
+
+        stat = self.configured_stats[row]
+        plotted = self._get_all_plotted_channels()
+
+        dialog = AddEditStatDialog(plotted, self.loaded_sources, existing_stat=stat, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            edited_stat = dialog.get_stat()
+            if edited_stat:
+                self.configured_stats[row] = edited_stat
+                self.recalculate_statistics()
+
+    def delete_selected_stat(self) -> None:
+        """Delete all currently selected statistics."""
+        selected_rows = sorted({item.row() for item in self.stats_table.selectedItems()}, reverse=True)
+        if not selected_rows:
+            return
+
+        if len(selected_rows) == 1:
+            stat = self.configured_stats[selected_rows[0]]
+            msg = f"Are you sure you want to delete '{stat.label}'?"
+        else:
+            msg = f"Are you sure you want to delete the {len(selected_rows)} selected statistics?"
+
+        confirm = QMessageBox.question(
+            self,
+            "Delete Statistics",
+            msg,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if confirm == QMessageBox.Yes:
+            for row in selected_rows:
+                self.configured_stats.pop(row)
+            self.recalculate_statistics()
+
+    def _get_all_plotted_channels(self) -> list[tuple[str, str, str, str]]:
+        """Return a list of all currently plotted channels across all tabs."""
+        plotted = []
+        seen = set()
+        for state in self.tabs_state:
+            tab_name = state.name
+            for ref in state.left_axis_series + state.right_axis_series:
+                key = (tab_name, ref.source_id, ref.group, ref.channel)
+                if key not in seen:
+                    plotted.append(key)
+                    seen.add(key)
+        return plotted
+
+    def recalculate_statistics(self) -> None:
+        """Compute statistics for all configured metrics using the active tab's visible viewport range."""
+        if not hasattr(self, "configured_stats"):
+            return
+
+        try:
+            xmin, xmax = self.plot_item.vb.viewRange()[0]
+        except Exception:
+            xmin, xmax = None, None
+
+        active_channels = {}
+        for ref in self.left_axis_series:
+            active_channels[(ref.source_id, ref.group, ref.channel)] = ref
+        for ref in self.right_axis_series:
+            active_channels[(ref.source_id, ref.group, ref.channel)] = ref
+
+        self.stats_table.setRowCount(len(self.configured_stats))
+
+        for idx, stat in enumerate(self.configured_stats):
+            key = (stat.source_id, stat.group, stat.channel)
+            is_active = key in active_channels
+
+            val_str = "N/A"
+            computed_val = None
+
+            if is_active and xmin is not None and xmax is not None:
+                ref = active_channels[key]
+                series = self._get_channel_data(ref)
+                if series is not None:
+                    x_full, y_full = series
+                    visible_mask = (x_full >= xmin) & (x_full <= xmax)
+                    x_vis = x_full[visible_mask]
+                    y_vis = y_full[visible_mask]
+
+                    if len(x_vis) > 0:
+                        # Apply pre-processing constant multiplier before anything else
+                        multiplier = getattr(stat, "multiplier", 1.0)
+                        y_vis = y_vis * multiplier
+
+                        x_t, y_t = x_vis, y_vis
+                        valid_calc = True
+
+                        if stat.transform == "deriv_raw":
+                            if len(x_vis) >= 2:
+                                dx = np.diff(x_vis)
+                                dx_mask = dx != 0
+                                if np.any(dx_mask):
+                                    y_t = np.diff(y_vis)[dx_mask] / dx[dx_mask]
+                                    x_t = ((x_vis[:-1] + x_vis[1:]) / 2.0)[dx_mask]
+                                else:
+                                    valid_calc = False
+                            else:
+                                valid_calc = False
+
+                        elif stat.transform == "deriv_smooth":
+                            if len(x_vis) >= 2:
+                                dx = np.diff(x_vis)
+                                dx_mask = dx != 0
+                                if np.any(dx_mask):
+                                    y_raw_deriv = np.diff(y_vis)[dx_mask] / dx[dx_mask]
+                                    x_raw_deriv = ((x_vis[:-1] + x_vis[1:]) / 2.0)[dx_mask]
+
+                                    window = 5
+                                    if len(y_raw_deriv) >= window:
+                                        y_t = np.convolve(y_raw_deriv, np.ones(window)/window, mode='valid')
+                                        start_idx = (window - 1) // 2
+                                        end_idx = start_idx + len(y_t)
+                                        x_t = x_raw_deriv[start_idx:end_idx]
+                                    else:
+                                        y_t = y_raw_deriv
+                                        x_t = x_raw_deriv
+                                else:
+                                    valid_calc = False
+                            else:
+                                valid_calc = False
+
+                        elif stat.transform == "diff":
+                            if len(x_vis) >= 2:
+                                y_t = np.diff(y_vis)
+                                x_t = x_vis[:-1]
+                            else:
+                                valid_calc = False
+
+                        if valid_calc and len(y_t) > 0:
+                            try:
+                                if stat.aggregation == "min":
+                                    computed_val = float(np.min(y_t))
+                                elif stat.aggregation == "max":
+                                    computed_val = float(np.max(y_t))
+                                elif stat.aggregation == "avg":
+                                    computed_val = float(np.mean(y_t))
+                                elif stat.aggregation == "median":
+                                    computed_val = float(np.median(y_t))
+                                elif stat.aggregation == "integral":
+                                    if len(x_t) >= 2:
+                                        dx = np.diff(x_t)
+                                        avg_y = (y_t[:-1] + y_t[1:]) / 2.0
+                                        computed_val = float(np.sum(avg_y * dx))
+                                    else:
+                                        computed_val = 0.0
+                                elif stat.aggregation == "net_change":
+                                    computed_val = float(y_t[-1] - y_t[0])
+                            except Exception:
+                                computed_val = None
+
+            if computed_val is not None:
+                stat.last_value = computed_val
+                val_str = f"{computed_val:.6g}"
+            elif stat.last_value is not None:
+                val_str = f"{stat.last_value:.6g}"
+
+            lbl_item = QTableWidgetItem(stat.label)
+            val_item = QTableWidgetItem(val_str)
+
+            if not is_active:
+                lbl_item.setFlags(lbl_item.flags() & ~Qt.ItemIsEnabled)
+                val_item.setFlags(val_item.flags() & ~Qt.ItemIsEnabled)
+
+            self.stats_table.setItem(idx, 0, lbl_item)
+            self.stats_table.setItem(idx, 1, val_item)
+
     def add_assignment_tab(self) -> None:
+
         """Create a new assignment tab, inheriting the current tab's settings."""
         curr_idx = self.assignment_tabs.currentIndex()
         if 0 <= curr_idx < len(self.tabs_state):
