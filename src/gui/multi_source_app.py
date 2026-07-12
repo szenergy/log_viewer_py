@@ -8,6 +8,22 @@ from typing import Any, Dict, Optional
 from dataclasses import dataclass
 import uuid
 
+def get_state_file_path() -> str:
+    import sys
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA")
+        if not base:
+            base = os.path.expanduser("~\\AppData\\Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME")
+        if not base:
+            base = os.path.expanduser("~/.config")
+            
+    folder = os.path.join(base, "SZEnergy", "Log_viewer")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "state.json")
+
+
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QIcon, QPainter, QPixmap, QPen, QBrush, QColor
@@ -117,7 +133,7 @@ class FileConfigDialog(QDialog):
 
         # Prescaler
         self.prescaler_spin = QDoubleSpinBox()
-        self.prescaler_spin.setRange(-1000000000.0, 1000000000.0)
+        self.prescaler_spin.setRange(-1000000000000.0, 1000000000000.0)
         self.prescaler_spin.setDecimals(6)
         self.prescaler_spin.setSingleStep(0.1)
         self.prescaler_spin.setValue(source.prescaler)
@@ -125,7 +141,7 @@ class FileConfigDialog(QDialog):
 
         # Offset
         self.offset_spin = QDoubleSpinBox()
-        self.offset_spin.setRange(-1000000000.0, 1000000000.0)
+        self.offset_spin.setRange(-1000000000000.0, 1000000000000.0)
         self.offset_spin.setDecimals(6)
         self.offset_spin.setSingleStep(1.0)
         self.offset_spin.setValue(source.offset)
@@ -134,10 +150,14 @@ class FileConfigDialog(QDialog):
         # X-axis combo box
         self.x_combo = QComboBox()
         self.x_combo.addItem("Sample Index (Default)", None)
+        self.x_combo.addItem("Sample Index (Reverse)", ("__special__", "reverse_index"))
 
         # Populate combo box with channels
         current_x_idx = 0
-        idx = 1
+        if source.x_channel == ("__special__", "reverse_index"):
+            current_x_idx = 1
+
+        idx = 2
         for group in source.structure.get("groups", []):
             group_name = group.get("name", "")
             for channel in group.get("channels", []):
@@ -180,41 +200,51 @@ class FileConfigDialog(QDialog):
 class SeriesConfigDialog(QDialog):
     """Modal dialog to configure a plotted series' local filter."""
 
-    def __init__(self, series_ref: SeriesRef, source: LoadedSource, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, series_ref: SeriesRef, sources: list[LoadedSource], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Configure Channel: {series_ref.channel}")
         self.resize(450, 180)
 
         self.series_ref = series_ref
-        self.source = source
+        self.sources = sources
 
         layout = QVBoxLayout(self)
-
         form_layout = QFormLayout()
 
         # Filter channel combo box
         self.filter_combo = QComboBox()
         self.filter_combo.addItem("None (Disabled)", None)
 
-        # Populate with channels from the same source
-        current_f_idx = 0
-        idx = 1
-        for group in source.structure.get("groups", []):
-            group_name = group.get("name", "")
-            for channel in group.get("channels", []):
-                channel_name = channel.get("name", "")
-                display_label = f"[{group_name}] {channel_name}" if source.kind != "csv" else channel_name
-                role_data = (group_name, channel_name)
+        if sources:
+            # Find the intersection of channel names across all selected sources
+            def get_source_channel_names(src: LoadedSource) -> set[str]:
+                names = set()
+                for group in src.structure.get("groups", []):
+                    for chan in group.get("channels", []):
+                        names.add(chan.get("name", ""))
+                return names
 
-                self.filter_combo.addItem(display_label, role_data)
+            common_names = get_source_channel_names(sources[0])
+            for s in sources[1:]:
+                common_names &= get_source_channel_names(s)
 
-                # Check Filter-channel match
-                if series_ref.filter_channel == role_data:
+            # Sort common channel names alphabetically
+            sorted_common = sorted(list(common_names))
+
+            # Populate combo box
+            current_f_idx = 0
+            idx = 1
+            for channel_name in sorted_common:
+                self.filter_combo.addItem(channel_name, channel_name)
+
+                # Check Filter-channel match (by channel name only)
+                if series_ref.filter_channel is not None and series_ref.filter_channel[1] == channel_name:
                     current_f_idx = idx
                 idx += 1
 
-        self.filter_combo.setCurrentIndex(current_f_idx)
-        form_layout.addRow("Filter Channel:", self.filter_combo)
+            self.filter_combo.setCurrentIndex(current_f_idx)
+
+        form_layout.addRow("Filter Channel Name:", self.filter_combo)
 
         # Filter value
         self.filter_val_spin = QDoubleSpinBox()
@@ -236,8 +266,8 @@ class SeriesConfigDialog(QDialog):
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
 
-    def get_settings(self) -> tuple[Optional[tuple[str, str]], float]:
-        """Return the filter channel and filter value."""
+    def get_settings(self) -> tuple[Optional[str], float]:
+        """Return the filter channel name and filter value."""
         return (
             self.filter_combo.currentData(),
             self.filter_val_spin.value()
@@ -613,7 +643,7 @@ class TdmsBrowserWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("TDMS Graph Explorer")
+        self.setWindowTitle("SZEnergy log viewer")
         self.resize(1200, 800)
 
         self.loaded_sources: dict[str, LoadedSource] = {}
@@ -633,6 +663,8 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_axis_series: list[SeriesRef] = self.tabs_state[0].left_axis_series
         self.right_axis_series: list[SeriesRef] = self.tabs_state[0].right_axis_series
         self.active_tab_index = 0
+        self.is_restoring_state = False
+        self.path_remappings = {}
 
         self.configured_stats: list[ConfiguredStat] = []
 
@@ -742,23 +774,23 @@ class TdmsBrowserWindow(QMainWindow):
                 background: transparent;
             }
             QTabBar::tab {
-                background: #f1f1f1;
-                border: 1px solid #dcdcdc;
+                background: palette(button);
+                border: 1px solid palette(mid);
                 border-bottom: none;
                 padding: 6px 12px;
                 margin-right: 2px;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
-                color: #555555;
+                color: palette(button-text);
             }
             QTabBar::tab:selected {
-                background: #ffffff;
-                border-color: #b8b8b8;
-                color: #000000;
+                background: palette(window);
+                border-color: palette(mid);
+                color: palette(text);
             }
             QTabBar::tab:hover {
-                background: #e5e5e5;
-                color: #000000;
+                background: palette(light);
+                color: palette(text);
             }
         """)
 
@@ -772,18 +804,18 @@ class TdmsBrowserWindow(QMainWindow):
                 background-color: transparent;
                 font-weight: bold;
                 font-size: 16px;
-                color: #555555;
+                color: palette(button-text);
                 margin-right: 2px;
                 margin-top: 1px;
                 padding: 3px 8px;
             }
             QPushButton:hover {
-                background-color: #e2e2e2;
-                color: #000000;
+                background-color: palette(light);
+                color: palette(text);
                 border-radius: 3px;
             }
             QPushButton:pressed {
-                background-color: #d0d0d0;
+                background-color: palette(dark);
             }
         """)
         self.add_tab_button.clicked.connect(self.add_assignment_tab)
@@ -812,12 +844,53 @@ class TdmsBrowserWindow(QMainWindow):
         right_layout.addWidget(self.plot_widget, 4)
         right_layout.addWidget(selection_box, 2)
 
-        tree_panel = QWidget()
-        tree_layout = QVBoxLayout(tree_panel)
-        tree_layout.addWidget(loaded_box)
-        tree_layout.addWidget(self.tree, 1)
-        tree_layout.addWidget(self.assign_left_button)
-        tree_layout.addWidget(self.assign_right_button)
+        # Create collapsible left sidebar container (starts open by default)
+        self.left_sidebar_container = QWidget()
+        self.left_sidebar_container.setMinimumWidth(166)
+        left_sidebar_layout = QHBoxLayout(self.left_sidebar_container)
+        left_sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        left_sidebar_layout.setSpacing(0)
+
+        # Left Sidebar Content
+        self.left_sidebar_content = QWidget()
+        self.left_sidebar_content.setObjectName("left_sidebar_content_widget")
+        self.left_sidebar_content.setStyleSheet("QWidget#left_sidebar_content_widget { background-color: palette(window); border-right: 1px solid palette(mid); }")
+
+        left_sidebar_content_layout = QVBoxLayout(self.left_sidebar_content)
+        left_sidebar_content_layout.setContentsMargins(4, 4, 4, 4)
+        left_sidebar_content_layout.setSpacing(4)
+        left_sidebar_content_layout.addWidget(loaded_box)
+        left_sidebar_content_layout.addWidget(self.tree, 1)
+        left_sidebar_content_layout.addWidget(self.assign_left_button)
+        left_sidebar_content_layout.addWidget(self.assign_right_button)
+
+        left_sidebar_layout.addWidget(self.left_sidebar_content)
+
+        # Left Sidebar Toggle Button
+        self.left_sidebar_toggle_btn = QPushButton("◀")
+        self.left_sidebar_toggle_btn.setFixedWidth(16)
+        self.left_sidebar_toggle_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.left_sidebar_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.left_sidebar_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background-color: palette(button);
+                border: 1px solid palette(mid);
+                border-top: none;
+                border-bottom: none;
+                color: palette(button-text);
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: palette(light);
+                color: palette(text);
+            }
+            QPushButton:pressed {
+                background-color: palette(dark);
+            }
+        """)
+        self.left_sidebar_toggle_btn.clicked.connect(self.toggle_left_sidebar)
+        left_sidebar_layout.addWidget(self.left_sidebar_toggle_btn)
 
         # Create collapsible sidebar container (starts collapsed)
         self.sidebar_container = QWidget()
@@ -832,20 +905,20 @@ class TdmsBrowserWindow(QMainWindow):
         self.sidebar_toggle_btn.setCursor(Qt.PointingHandCursor)
         self.sidebar_toggle_btn.setStyleSheet("""
             QPushButton {
-                background-color: #f1f1f1;
-                border: 1px solid #dcdcdc;
+                background-color: palette(button);
+                border: 1px solid palette(mid);
                 border-top: none;
                 border-bottom: none;
-                color: #555555;
+                color: palette(button-text);
                 font-weight: bold;
                 font-size: 11px;
             }
             QPushButton:hover {
-                background-color: #e5e5e5;
-                color: #000000;
+                background-color: palette(light);
+                color: palette(text);
             }
             QPushButton:pressed {
-                background-color: #d0d0d0;
+                background-color: palette(dark);
             }
         """)
         self.sidebar_toggle_btn.clicked.connect(self.toggle_sidebar)
@@ -854,14 +927,14 @@ class TdmsBrowserWindow(QMainWindow):
         # Sidebar content panel
         self.sidebar_content = QWidget()
         self.sidebar_content.setObjectName("sidebar_content_widget")
-        self.sidebar_content.setStyleSheet("QWidget#sidebar_content_widget { background-color: #ffffff; border-left: 1px solid #dcdcdc; }")
+        self.sidebar_content.setStyleSheet("QWidget#sidebar_content_widget { background-color: palette(window); border-left: 1px solid palette(mid); }")
         sidebar_content_layout = QVBoxLayout(self.sidebar_content)
         sidebar_content_layout.setContentsMargins(4, 4, 4, 4)
         sidebar_content_layout.setSpacing(4)
 
         # Title
         sidebar_title = QLabel("Statistics")
-        sidebar_title.setStyleSheet("font-size: 14px; color: #333333; margin-bottom: 4px;")
+        sidebar_title.setStyleSheet("font-size: 14px; margin-bottom: 4px;")
         sidebar_content_layout.addWidget(sidebar_title)
 
         # Stats Table
@@ -901,7 +974,7 @@ class TdmsBrowserWindow(QMainWindow):
         self.sidebar_container.setFixedWidth(16)
 
         self.main_splitter = QSplitter()
-        self.main_splitter.addWidget(tree_panel)
+        self.main_splitter.addWidget(self.left_sidebar_container)
         self.main_splitter.addWidget(right_panel)
         self.main_splitter.addWidget(self.sidebar_container)
         self.main_splitter.setStretchFactor(0, 2)
@@ -915,6 +988,9 @@ class TdmsBrowserWindow(QMainWindow):
         central_layout = QVBoxLayout(central_widget)
         central_layout.addWidget(self.main_splitter, 1)
         self.setCentralWidget(central_widget)
+
+        # Restore previous session state
+        self.load_state()
 
     def _open_native_file_dialog(self) -> Optional[list[str]]:
         """Attempt to open the native OS file picker (zenity/kdialog on Linux)."""
@@ -1059,6 +1135,7 @@ class TdmsBrowserWindow(QMainWindow):
 
                 self.refresh_loaded_sources_view()
                 self.refresh_tree()
+                self.save_state()
 
             if errors:
                 QMessageBox.warning(
@@ -1099,6 +1176,7 @@ class TdmsBrowserWindow(QMainWindow):
             self.refresh_loaded_sources_view()
             self.refresh_tree()
             self.update_plot()
+            self.save_state()
 
     def configure_source_by_tree_item(self, item: QTreeWidgetItem, column: int) -> None:
         """Open the configuration dialog for a loaded file or channel when double-clicked in the tree."""
@@ -1124,6 +1202,7 @@ class TdmsBrowserWindow(QMainWindow):
                 self.refresh_loaded_sources_view()
                 self.refresh_tree()
                 self.update_plot()
+                self.save_state()
 
         elif "source_id" in payload and "group" in payload and "channel" in payload:
             source_id = payload["source_id"]
@@ -1150,6 +1229,17 @@ class TdmsBrowserWindow(QMainWindow):
 
                 self.refresh_tree()
                 self.update_plot()
+                self.save_state()
+
+    def _find_group_and_channel_by_name(self, source: LoadedSource, channel_name: str) -> Optional[tuple[str, str]]:
+        """Find the (group_name, channel_name) tuple for a given channel name in a source structure."""
+        for group in source.structure.get("groups", []):
+            g_name = group.get("name", "")
+            for chan in group.get("channels", []):
+                c_name = chan.get("name", "")
+                if c_name == channel_name:
+                    return (g_name, c_name)
+        return None
 
     def configure_series_by_item(self, item: QListWidgetItem, axis: str) -> None:
         """Open the configuration dialog for a plotted channel when double-clicked."""
@@ -1166,17 +1256,21 @@ class TdmsBrowserWindow(QMainWindow):
         if source is None:
             return
 
-        dialog = SeriesConfigDialog(ref, source, self)
+        dialog = SeriesConfigDialog(ref, [source], self)
         if dialog.exec() == QDialog.Accepted:
-            f_chan, f_val = dialog.get_settings()
-            ref.filter_channel = f_chan
+            f_chan_name, f_val = dialog.get_settings()
+            if f_chan_name is None:
+                ref.filter_channel = None
+            else:
+                ref.filter_channel = self._find_group_and_channel_by_name(source, f_chan_name)
             ref.filter_value = f_val
 
             self._refresh_series_list(axis)
             self.update_plot()
+            self.save_state()
 
     def set_filter_for_selected(self) -> None:
-        """Set the same filter settings for all selected channels in the axis lists (must be from the same file)."""
+        """Set the same filter settings for all selected channels in the axis lists."""
         left_sel = self.left_series_list.selectedItems()
         right_sel = self.right_series_list.selectedItems()
 
@@ -1198,33 +1292,32 @@ class TdmsBrowserWindow(QMainWindow):
             )
             return
 
-        # Ensure all selected channels are from the same loaded file
+        # Gather all unique source objects
         source_ids = {ref.source_id for ref in selected_refs}
-        if len(source_ids) > 1:
-            QMessageBox.warning(
-                self,
-                "Multiple Files Selected",
-                "Batch filtering can only be applied to channels from the same file. Please select channels from one file only."
-            )
-            return
-
-        source_id = list(source_ids)[0]
-        source = self.loaded_sources.get(source_id)
-        if source is None:
+        sources = [self.loaded_sources.get(sid) for sid in source_ids if self.loaded_sources.get(sid) is not None]
+        if not sources:
             return
 
         # Open SeriesConfigDialog using the first selected channel's settings as template
         template_ref = selected_refs[0]
-        dialog = SeriesConfigDialog(template_ref, source, self)
+        dialog = SeriesConfigDialog(template_ref, sources, self)
         if dialog.exec() == QDialog.Accepted:
-            f_chan, f_val = dialog.get_settings()
+            f_chan_name, f_val = dialog.get_settings()
             for ref in selected_refs:
-                ref.filter_channel = f_chan
+                if f_chan_name is None:
+                    ref.filter_channel = None
+                else:
+                    ref_source = self.loaded_sources.get(ref.source_id)
+                    if ref_source:
+                        ref.filter_channel = self._find_group_and_channel_by_name(ref_source, f_chan_name)
+                    else:
+                        ref.filter_channel = None
                 ref.filter_value = f_val
 
             self._refresh_series_list("left")
             self._refresh_series_list("right")
             self.update_plot()
+            self.save_state()
 
     def unload_selected_sources(self) -> None:
         """Remove the selected loaded files from the app."""
@@ -1247,6 +1340,7 @@ class TdmsBrowserWindow(QMainWindow):
         self._refresh_series_list("left")
         self._refresh_series_list("right")
         self.update_plot()
+        self.save_state()
 
     def clear_loaded_sources(self) -> None:
         """Remove all loaded sources and plotted series."""
@@ -1263,6 +1357,7 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_series_list.clear()
         self.right_series_list.clear()
         self.update_plot()
+        self.save_state()
 
     def refresh_loaded_sources_view(self) -> None:
         """Refresh the loaded-files list."""
@@ -1384,6 +1479,7 @@ class TdmsBrowserWindow(QMainWindow):
         self._refresh_series_list("left")
         self._refresh_series_list("right")
         self.update_plot()
+        self.save_state()
 
         axis_name = "left" if axis == "left" else "right"
 
@@ -1421,6 +1517,7 @@ class TdmsBrowserWindow(QMainWindow):
             self._refresh_series_list("left")
             self._refresh_series_list("right")
             self.update_plot()
+            self.save_state()
 
     def clear_assignments(self) -> None:
         """Clear both axis assignments and reset the plot."""
@@ -1429,6 +1526,7 @@ class TdmsBrowserWindow(QMainWindow):
         self.left_series_list.clear()
         self.right_series_list.clear()
         self.update_plot()
+        self.save_state()
 
     def update_plot(self) -> None:
         """Render the currently assigned channels on a shared plot with two Y axes."""
@@ -1561,12 +1659,21 @@ class TdmsBrowserWindow(QMainWindow):
                     if dot: dot.hide()
                     continue
 
-                # Find nearest x index using fast binary search (fallback to argmin if not sorted)
+                # Find nearest x index using fast binary search (supporting ascending and descending orders)
                 if len(x_vals) > 0:
-                    idx = np.searchsorted(x_vals, x)
-                    idx = np.clip(idx, 0, len(x_vals) - 1)
-                    if idx > 0 and abs(x_vals[idx - 1] - x) < abs(x_vals[idx] - x):
-                        idx -= 1
+                    if len(x_vals) >= 2 and x_vals[0] > x_vals[-1]:
+                        # Descending array (e.g. reverse sample index)
+                        rev_idx = np.searchsorted(x_vals[::-1], x)
+                        rev_idx = np.clip(rev_idx, 0, len(x_vals) - 1)
+                        if rev_idx > 0 and abs(x_vals[::-1][rev_idx - 1] - x) < abs(x_vals[::-1][rev_idx] - x):
+                            rev_idx -= 1
+                        idx = len(x_vals) - 1 - rev_idx
+                    else:
+                        # Ascending or single element
+                        idx = np.searchsorted(x_vals, x)
+                        idx = np.clip(idx, 0, len(x_vals) - 1)
+                        if idx > 0 and abs(x_vals[idx - 1] - x) < abs(x_vals[idx] - x):
+                            idx -= 1
                     nearest_x = x_vals[idx]
                     nearest_y = y_vals[idx]
                 else:
@@ -1733,6 +1840,41 @@ class TdmsBrowserWindow(QMainWindow):
                 sizes[2] = restore_width
                 self.main_splitter.setSizes(sizes)
 
+    def toggle_left_sidebar(self) -> None:
+        """Collapse or expand the left sidebar containing the file list and tree view."""
+        is_visible = self.left_sidebar_content.isVisible()
+        if is_visible:
+            # Save the current width of the sidebar before collapsing so we can restore it
+            self._left_sidebar_last_width = self.left_sidebar_container.width()
+            self.left_sidebar_content.hide()
+            self.left_sidebar_toggle_btn.setText("▶")
+            # Lock the sidebar container width to 16px (collapsed state)
+            self.left_sidebar_container.setFixedWidth(16)
+            # Update splitter sizes so the collapsed sidebar is tight (only 16px)
+            sizes = self.main_splitter.sizes()
+            if len(sizes) == 3:
+                # Give the collapsed space back to the middle panel
+                sizes[1] += sizes[0] - 16
+                sizes[0] = 16
+                self.main_splitter.setSizes(sizes)
+        else:
+            # Unlock the sidebar container width with a minimum size of 166px (150px content + 16px button)
+            self.left_sidebar_container.setMinimumWidth(166)
+            self.left_sidebar_container.setMaximumWidth(16777215) # QWIDGETSIZE_MAX
+            
+            self.left_sidebar_content.show()
+            self.left_sidebar_toggle_btn.setText("◀")
+            # Restore to previous width, or default to a reasonable width (similar to tree view)
+            sizes = self.main_splitter.sizes()
+            if len(sizes) == 3:
+                restore_width = getattr(self, "_left_sidebar_last_width", 250)
+                if restore_width < 100:
+                    restore_width = 250
+                # Take space from the middle panel to expand the sidebar
+                sizes[1] = max(200, sizes[1] - (restore_width - 16))
+                sizes[0] = restore_width
+                self.main_splitter.setSizes(sizes)
+
     def add_new_stat(self) -> None:
         """Open the dialog to add a new statistic."""
         plotted = self._get_all_plotted_channels()
@@ -1746,6 +1888,7 @@ class TdmsBrowserWindow(QMainWindow):
             if new_stat:
                 self.configured_stats.append(new_stat)
                 self.recalculate_statistics()
+                self.save_state()
 
     def edit_selected_stat(self, item: QTableWidgetItem) -> None:
         """Open the dialog to edit the double-clicked statistic."""
@@ -1762,6 +1905,7 @@ class TdmsBrowserWindow(QMainWindow):
             if edited_stat:
                 self.configured_stats[row] = edited_stat
                 self.recalculate_statistics()
+                self.save_state()
 
     def delete_selected_stat(self) -> None:
         """Delete all currently selected statistics."""
@@ -1786,6 +1930,7 @@ class TdmsBrowserWindow(QMainWindow):
             for row in selected_rows:
                 self.configured_stats.pop(row)
             self.recalculate_statistics()
+            self.save_state()
 
     def _get_all_plotted_channels(self) -> list[tuple[str, str, str]]:
         """Return a list of all unique currently plotted channels across all tabs."""
@@ -2030,6 +2175,7 @@ class TdmsBrowserWindow(QMainWindow):
 
         # 6. Set the new active tab index
         self.active_tab_index = index
+        self.save_state()
 
     def handle_tab_close(self, index: int) -> None:
         """Close the tab at the given index, preserving at least one tab."""
@@ -2076,6 +2222,7 @@ class TdmsBrowserWindow(QMainWindow):
             new_name = new_name.strip()
             self.tabs_state[index].name = new_name
             self.assignment_tabs.setTabText(index, new_name)
+            self.save_state()
 
 
 
@@ -2088,6 +2235,384 @@ class TdmsBrowserWindow(QMainWindow):
             return f"{float(value):.6g}"
         except Exception:
             return str(value)
+
+    def closeEvent(self, event) -> None:
+        """Save the application state upon closing the window."""
+        self.save_state()
+        
+        # Disconnect pyqtgraph signals to prevent sizeHint/boundingRect calls on deleted C++ objects during teardown
+        try:
+            self.plot_item.vb.sigResized.disconnect(self._update_right_view)
+        except Exception:
+            pass
+        try:
+            self.plot_item.vb.sigYRangeChanged.disconnect(self.sync_right_y_zoom)
+        except Exception:
+            pass
+        try:
+            self.right_view_box.sigYRangeChanged.disconnect(self.on_right_y_range_changed)
+        except Exception:
+            pass
+        try:
+            self.plot_item.scene().sigMouseMoved.disconnect(self.mouse_moved)
+        except Exception:
+            pass
+        try:
+            self.plot_item.sigXRangeChanged.disconnect(self.recalculate_statistics)
+        except Exception:
+            pass
+            
+        try:
+            self.plot_item.scene().removeItem(self.right_view_box)
+        except Exception:
+            pass
+        try:
+            self.plot_widget.clear()
+        except Exception:
+            pass
+            
+        event.accept()
+
+    def save_state(self) -> None:
+        """Serialize and save the current application state to JSON."""
+        if getattr(self, "is_restoring_state", False):
+            return
+            
+        state_path = get_state_file_path()
+        
+        # Serialize loaded sources
+        sources_data = []
+        for source_id, source in self.loaded_sources.items():
+            sources_data.append({
+                "file_path": os.path.abspath(source.path),
+                "source_id": source.source_id,
+                "display_name": source.display_name,
+                "prescaler": source.prescaler,
+                "offset": source.offset,
+                "x_channel": source.x_channel,
+                "channel_limits": [[g, c, limits] for (g, c), limits in source.channel_limits.items()]
+            })
+            
+        # Serialize tabs
+        tabs_data = []
+        for tab in self.tabs_state:
+            left_series = []
+            for ref in tab.left_axis_series:
+                left_series.append({
+                    "source_id": ref.source_id,
+                    "group": ref.group,
+                    "channel": ref.channel,
+                    "color": ref.color,
+                    "filter_channel": ref.filter_channel,
+                    "filter_value": ref.filter_value
+                })
+            right_series = []
+            for ref in tab.right_axis_series:
+                right_series.append({
+                    "source_id": ref.source_id,
+                    "group": ref.group,
+                    "channel": ref.channel,
+                    "color": ref.color,
+                    "filter_channel": ref.filter_channel,
+                    "filter_value": ref.filter_value
+                })
+            tabs_data.append({
+                "name": tab.name,
+                "left_axis_series": left_series,
+                "right_axis_series": right_series
+            })
+            
+        # Serialize graph view limits
+        try:
+            xmin, xmax = self.plot_item.vb.viewRange()[0]
+            ymin, ymax = self.plot_item.vb.viewRange()[1]
+            rymin, rymax = self.right_view_box.viewRange()[1]
+            graph_view = {
+                "x_range": [xmin, xmax],
+                "left_y_range": [ymin, ymax],
+                "right_y_range": [rymin, rymax]
+            }
+        except Exception:
+            graph_view = None
+            
+        # Serialize configured stats
+        stats_data = []
+        for stat in self.configured_stats:
+            stats_data.append({
+                "stat_id": stat.stat_id,
+                "label": stat.label,
+                "source_id": stat.source_id,
+                "group": stat.group,
+                "channel": stat.channel,
+                "transform": stat.transform,
+                "aggregation": stat.aggregation,
+                "multiplier": stat.multiplier,
+                "stat_min": stat.stat_min,
+                "stat_max": stat.stat_max,
+                "last_value": stat.last_value
+            })
+            
+        # Serialize sidebars
+        sidebars_data = {
+            "left_collapsed": not self.left_sidebar_content.isVisible(),
+            "right_collapsed": not self.sidebar_content.isVisible()
+        }
+        
+        state = {
+            "version": 1,
+            "loaded_sources": sources_data,
+            "tabs": tabs_data,
+            "active_tab_index": self.assignment_tabs.currentIndex(),
+            "graph_view": graph_view,
+            "configured_stats": stats_data,
+            "sidebars": sidebars_data
+        }
+        
+        try:
+            import json
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"Error saving state: {e}")
+
+    def load_state(self) -> None:
+        """Load and apply the saved application state from JSON on startup."""
+        state_path = get_state_file_path()
+        if not os.path.exists(state_path):
+            return
+            
+        try:
+            import json
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as e:
+            print(f"Error reading state file: {e}")
+            return
+            
+        self.is_restoring_state = True
+        self.pending_restore_files = {}
+        self.path_remappings = {}
+        
+        sources_to_process = state.get("loaded_sources", [])
+        actual_paths = []
+        
+        for src_data in sources_to_process:
+            orig_path = src_data.get("file_path")
+            if not orig_path:
+                continue
+                
+            actual_path = os.path.abspath(orig_path)
+            # If the file doesn't exist, ask the user to replace or ignore
+            if not os.path.exists(actual_path):
+                # Prompt user
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("Missing File")
+                msg_box.setText(f"The session file could not be found:\n{orig_path}\n\nWould you like to locate/replace it, or ignore it?")
+                replace_btn = msg_box.addButton("Replace/Locate", QMessageBox.ActionRole)
+                ignore_btn = msg_box.addButton("Ignore", QMessageBox.RejectRole)
+                msg_box.setDefaultButton(ignore_btn)
+                msg_box.exec()
+                
+                if msg_box.clickedButton() == replace_btn:
+                    # Open file chooser
+                    ext = os.path.splitext(actual_path)[1].lower()
+                    filter_str = f"Compatible Files (*{ext})" if ext else "All Files (*)"
+                    new_path, _ = QFileDialog.getOpenFileName(
+                        self,
+                        f"Locate Replacement for {os.path.basename(actual_path)}",
+                        os.path.dirname(actual_path) or "",
+                        filter_str
+                    )
+                    if new_path:
+                        actual_path = os.path.abspath(new_path)
+                        self.path_remappings[orig_path] = actual_path
+                    else:
+                        # User cancelled file picker, treat as ignore
+                        continue
+                else:
+                    # User clicked Ignore
+                    continue
+            
+            # Add to pending restore queue
+            self.pending_restore_files[actual_path] = src_data
+            actual_paths.append(actual_path)
+            
+        if not self.pending_restore_files:
+            # Re-apply non-file state if no files need loading
+            self.is_restoring_state = False
+            self._finish_state_restore(state)
+            return
+            
+        # Spawn loader threads for all pending files
+        self.restore_saved_state = state
+        self.restore_processed_count = 0
+        
+        # Disable main window interface temporarily while loading
+        self.setEnabled(False)
+        self.restore_progress = QProgressDialog("Restoring session: loading files...", "Cancel", 0, len(actual_paths), self)
+        self.restore_progress.setWindowModality(Qt.WindowModal)
+        self.restore_progress.setAutoClose(True)
+        self.restore_progress.setValue(0)
+        self.restore_progress.show()
+        
+        # Spawn a single loader thread for sequential loading
+        self.restore_thread = FileLoaderThread(actual_paths, self)
+        self.restore_progress.canceled.connect(self.restore_thread.cancel)
+        self.restore_thread.file_loaded.connect(self._on_restore_file_loaded)
+        self.restore_thread.finished_loading.connect(self._on_restore_finished_loading)
+        self.restore_thread.finished.connect(self.restore_thread.deleteLater)
+        self.restore_thread.start()
+
+    def _on_restore_file_loaded(self, result: Any) -> None:
+        """Handle completion of a restore file loader thread."""
+        self.restore_processed_count += 1
+        self.restore_progress.setValue(self.restore_processed_count)
+        
+        if isinstance(result, LoadedSource):
+            # Succeeded
+            source = result
+            # Normalize path to ensure lookup match
+            file_path = os.path.abspath(source.path)
+            saved_config = self.pending_restore_files.get(file_path)
+            if saved_config:
+                # Set source_id to the saved original source_id so references resolve
+                saved_source_id = saved_config["source_id"]
+                source.source_id = saved_source_id
+                
+                source.prescaler = saved_config.get("prescaler", 1.0)
+                source.offset = saved_config.get("offset", 0.0)
+                source.x_channel = saved_config.get("x_channel")
+                # Handle special case: JSON converts tuple to list, convert back if needed
+                if isinstance(source.x_channel, list):
+                    source.x_channel = tuple(source.x_channel)
+                
+                # Rebuild channel limits
+                limits_data = saved_config.get("channel_limits", [])
+                source.channel_limits = {}
+                for g, c, limits in limits_data:
+                    source.channel_limits[(g, c)] = limits
+                    
+                self.loaded_sources[saved_source_id] = source
+                self.source_order.append(saved_source_id)
+
+    def _on_restore_finished_loading(self) -> None:
+        """Finish loading files and restore state."""
+        self.setEnabled(True)
+        self.restore_progress.close()
+        self.is_restoring_state = False
+        self._finish_state_restore(self.restore_saved_state)
+
+    def _finish_state_restore(self, state: dict) -> None:
+        """Apply the remaining loaded state configurations (tabs, zoom, stats) after files are reloaded."""
+        # 1. Restore tabs state
+        tabs_data = state.get("tabs", [])
+        if tabs_data:
+            self.tabs_state.clear()
+            for t_data in tabs_data:
+                left_ref_list = []
+                for ref_data in t_data.get("left_axis_series", []):
+                    ref_sid = ref_data["source_id"]
+                    if ref_sid in self.loaded_sources:
+                        left_ref_list.append(SeriesRef(
+                            source_id=ref_sid,
+                            group=ref_data["group"],
+                            channel=ref_data["channel"],
+                            color=ref_data.get("color"),
+                            filter_channel=ref_data.get("filter_channel"),
+                            filter_value=ref_data.get("filter_value", 0.0)
+                        ))
+                right_ref_list = []
+                for ref_data in t_data.get("right_axis_series", []):
+                    ref_sid = ref_data["source_id"]
+                    if ref_sid in self.loaded_sources:
+                        right_ref_list.append(SeriesRef(
+                            source_id=ref_sid,
+                            group=ref_data["group"],
+                            channel=ref_data["channel"],
+                            color=ref_data.get("color"),
+                            filter_channel=ref_data.get("filter_channel"),
+                            filter_value=ref_data.get("filter_value", 0.0)
+                        ))
+                self.tabs_state.append(AssignmentTabState(
+                    name=t_data["name"],
+                    left_series=left_ref_list,
+                    right_series=right_ref_list
+                ))
+            
+            # Rebuild assignment tabs widgets
+            self.assignment_tabs.currentChanged.disconnect(self.handle_tab_changed)
+            try:
+                self.assignment_tabs.clear()
+                for idx, tab_state in enumerate(self.tabs_state):
+                    tab_page = QWidget()
+                    tab_layout = QVBoxLayout(tab_page)
+                    tab_layout.setContentsMargins(0, 4, 0, 0)
+                    self.assignment_tabs.addTab(tab_page, tab_state.name)
+            finally:
+                self.assignment_tabs.currentChanged.connect(self.handle_tab_changed)
+            
+            # Restore active tab index
+            active_idx = state.get("active_tab_index", 0)
+            if 0 <= active_idx < self.assignment_tabs.count():
+                self.assignment_tabs.setCurrentIndex(active_idx)
+                self.active_tab_index = active_idx
+                self.left_axis_series = self.tabs_state[active_idx].left_axis_series
+                self.right_axis_series = self.tabs_state[active_idx].right_axis_series
+                # Manually trigger layout shift to ensure the container_widget is populated
+                self.handle_tab_changed(active_idx)
+                
+        # 2. Restore configured stats
+        stats_data = state.get("configured_stats", [])
+        self.configured_stats.clear()
+        for s_data in stats_data:
+            ref_sid = s_data["source_id"]
+            if ref_sid in self.loaded_sources:
+                self.configured_stats.append(ConfiguredStat(
+                    stat_id=s_data["stat_id"],
+                    label=s_data["label"],
+                    source_id=ref_sid,
+                    group=s_data["group"],
+                    channel=s_data["channel"],
+                    transform=s_data["transform"],
+                    aggregation=s_data["aggregation"],
+                    multiplier=s_data.get("multiplier", 1.0),
+                    stat_min=s_data.get("stat_min"),
+                    stat_max=s_data.get("stat_max"),
+                    last_value=s_data.get("last_value")
+                ))
+
+        # Refresh GUI components
+        self.refresh_loaded_sources_view()
+        self.refresh_tree()
+        self._refresh_series_list("left")
+        self._refresh_series_list("right")
+        self.update_plot()
+        
+        # 3. Restore graph view limits
+        graph_view = state.get("graph_view")
+        if graph_view:
+            x_range = graph_view.get("x_range")
+            if x_range:
+                self.plot_item.vb.setXRange(x_range[0], x_range[1], padding=0)
+            left_y_range = graph_view.get("left_y_range")
+            if left_y_range:
+                self.plot_item.vb.setYRange(left_y_range[0], left_y_range[1], padding=0)
+            right_y_range = graph_view.get("right_y_range")
+            if right_y_range:
+                self.right_view_box.setYRange(right_y_range[0], right_y_range[1], padding=0)
+                
+        # 4. Restore sidebars states
+        sidebars_data = state.get("sidebars")
+        if sidebars_data:
+            left_coll = sidebars_data.get("left_collapsed", False)
+            right_coll = sidebars_data.get("right_collapsed", True)
+            
+            # Left sidebar: starts open. If it should be collapsed, toggle it.
+            if left_coll:
+                self.toggle_left_sidebar()
+            # Right sidebar: starts collapsed. If it should be open, toggle it.
+            if not right_coll:
+                self.toggle_sidebar()
 
 
 def run_gui(initial_path: Optional[str] = None) -> int:

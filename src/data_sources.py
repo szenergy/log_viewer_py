@@ -187,8 +187,13 @@ def _build_csv_structure(filepath: str, frame: pd.DataFrame) -> Dict[str, Any]:
 
 def get_source_label(source: LoadedSource) -> str:
     """Return a compact label for the loaded-files list."""
-    x_desc = "Index" if source.x_channel is None else f"{source.x_channel[0]}/{source.x_channel[1]}"
-    return f"{source.display_name} [{source.kind.upper()}]\n(Mult ={source.prescaler:.3g}, Offset = {source.offset:.3g}, X = {x_desc})"
+    if source.x_channel is None:
+        x_desc = "Index"
+    elif source.x_channel == ("__special__", "reverse_index"):
+        x_desc = "Reverse Index"
+    else:
+        x_desc = f"{source.x_channel[0]}/{source.x_channel[1]}"
+    return f"{source.display_name}\n(Mult ={source.prescaler:.3g}, Offset = {source.offset:.3g}, X = {x_desc})"
 
 
 def _get_raw_channel_data(source: LoadedSource, group_name: str, channel_name: str) -> Optional[np.ndarray]:
@@ -266,7 +271,10 @@ def get_channel_data(
     # Extract aligned raw values
     y_aligned = y_raw[:min_len]
     if x_raw is None or len(x_raw) == 0:
-        x_aligned = np.arange(min_len)
+        if source.x_channel == ("__special__", "reverse_index"):
+            x_aligned = np.arange(min_len - 1, -1, -1)
+        else:
+            x_aligned = np.arange(min_len)
     else:
         x_aligned = x_raw[:min_len]
 
