@@ -25,7 +25,7 @@ def get_state_file_path() -> str:
 
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QIcon, QPainter, QPixmap, QPen, QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication,
@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QTabWidget,
+    QTabBar,
     QInputDialog,
     QGraphicsRectItem,
     QSizePolicy,
@@ -91,7 +92,9 @@ class AssignmentTabState:
                 series_id=s.series_id,
                 filter_channel=s.filter_channel,
                 filter_value=s.filter_value,
-                color=s.color
+                color=s.color,
+                offset=getattr(s, "offset", 0.0),
+                x_offset=getattr(s, "x_offset", 0.0)
             ) for s in left_series
         ]
         self.right_axis_series = [
@@ -102,7 +105,9 @@ class AssignmentTabState:
                 series_id=s.series_id,
                 filter_channel=s.filter_channel,
                 filter_value=s.filter_value,
-                color=s.color
+                color=s.color,
+                offset=getattr(s, "offset", 0.0),
+                x_offset=getattr(s, "x_offset", 0.0)
             ) for s in right_series
         ]
         # Viewport state
@@ -133,7 +138,7 @@ class FileConfigDialog(QDialog):
 
         # Prescaler
         self.prescaler_spin = QDoubleSpinBox()
-        self.prescaler_spin.setRange(-1000000000000.0, 1000000000000.0)
+        self.prescaler_spin.setRange(float('-inf'), float('inf'))
         self.prescaler_spin.setDecimals(6)
         self.prescaler_spin.setSingleStep(0.1)
         self.prescaler_spin.setValue(source.prescaler)
@@ -141,7 +146,7 @@ class FileConfigDialog(QDialog):
 
         # Offset
         self.offset_spin = QDoubleSpinBox()
-        self.offset_spin.setRange(-1000000000000.0, 1000000000000.0)
+        self.offset_spin.setRange(float('-inf'), float('inf'))
         self.offset_spin.setDecimals(6)
         self.offset_spin.setSingleStep(1.0)
         self.offset_spin.setValue(source.offset)
@@ -197,13 +202,13 @@ class FileConfigDialog(QDialog):
         )
 
 
-class SeriesConfigDialog(QDialog):
-    """Modal dialog to configure a plotted series' local filter."""
+class ChannelOptionsDialog(QDialog):
+    """Modal dialog to configure a plotted series' local channel options (filters and offsets)."""
 
     def __init__(self, series_ref: SeriesRef, sources: list[LoadedSource], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Configure Channel: {series_ref.channel}")
-        self.resize(450, 180)
+        self.setWindowTitle(f"Channel Options: {series_ref.channel}")
+        self.resize(450, 250)
 
         self.series_ref = series_ref
         self.sources = sources
@@ -248,11 +253,27 @@ class SeriesConfigDialog(QDialog):
 
         # Filter value
         self.filter_val_spin = QDoubleSpinBox()
-        self.filter_val_spin.setRange(-1000000000.0, 1000000000.0)
+        self.filter_val_spin.setRange(float('-inf'), float('inf'))
         self.filter_val_spin.setDecimals(5)
         self.filter_val_spin.setSingleStep(1.0)
         self.filter_val_spin.setValue(series_ref.filter_value)
         form_layout.addRow("Filter Value:", self.filter_val_spin)
+
+        # Local Y-Axis Offset
+        self.offset_spin = QDoubleSpinBox()
+        self.offset_spin.setRange(float('-inf'), float('inf'))
+        self.offset_spin.setDecimals(5)
+        self.offset_spin.setSingleStep(1.0)
+        self.offset_spin.setValue(getattr(series_ref, "offset", 0.0))
+        form_layout.addRow("Local Y-Axis Offset:", self.offset_spin)
+
+        # Local X-Axis Offset
+        self.x_offset_spin = QDoubleSpinBox()
+        self.x_offset_spin.setRange(float('-inf'), float('inf'))
+        self.x_offset_spin.setDecimals(5)
+        self.x_offset_spin.setSingleStep(1.0)
+        self.x_offset_spin.setValue(getattr(series_ref, "x_offset", 0.0))
+        form_layout.addRow("Local X-Axis Offset:", self.x_offset_spin)
 
         layout.addLayout(form_layout)
 
@@ -266,12 +287,15 @@ class SeriesConfigDialog(QDialog):
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
 
-    def get_settings(self) -> tuple[Optional[str], float]:
-        """Return the filter channel name and filter value."""
+    def get_settings(self) -> tuple[Optional[str], float, float, float]:
+        """Return the filter channel name, filter value, local Y offset, and local X offset."""
         return (
             self.filter_combo.currentData(),
-            self.filter_val_spin.value()
+            self.filter_val_spin.value(),
+            self.offset_spin.value(),
+            self.x_offset_spin.value()
         )
+
 
 
 class ChannelLimitDialog(QDialog):
@@ -408,7 +432,7 @@ class AddEditStatDialog(QDialog):
 
         # Multiplier
         self.multiplier_spin = QDoubleSpinBox()
-        self.multiplier_spin.setRange(-1000000000.0, 1000000000.0)
+        self.multiplier_spin.setRange(float('-inf'), float('inf'))
         self.multiplier_spin.setDecimals(6)
         self.multiplier_spin.setSingleStep(1.0)
         if existing_stat:
@@ -595,10 +619,49 @@ class XZoomViewBox(pg.ViewBox):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.x_zoom_rect = None
+        self.zoom_cancelled = False
+
+    def keyPressEvent(self, ev: Any) -> None:
+        if ev.key() == Qt.Key_Escape:
+            if self.x_zoom_rect and self.x_zoom_rect.isVisible():
+                self.x_zoom_rect.hide()
+                self.zoom_cancelled = True
+                ev.accept()
+                return
+        super().keyPressEvent(ev)
 
     def mouseDragEvent(self, ev: Any) -> None:
-        # Left button drag triggers custom X-axis zoom (holding Shift falls back to standard panning)
-        if ev.button() == Qt.LeftButton and not (ev.modifiers() & Qt.ShiftModifier):
+        # Ctrl + Left Button drag triggers custom panning
+        if ev.button() == Qt.LeftButton and (ev.modifiers() & Qt.ControlModifier):
+            ev.accept()
+            
+            # Compute movement in view coordinates
+            last_view = self.mapSceneToView(ev.lastScenePos())
+            current_view = self.mapSceneToView(ev.scenePos())
+            
+            dx = last_view.x() - current_view.x()
+            dy = last_view.y() - current_view.y()
+            
+            # Shift view ranges
+            x_range = self.viewRange()[0]
+            y_range = self.viewRange()[1]
+            
+            self.setXRange(x_range[0] + dx, x_range[1] + dx, padding=0)
+            self.setYRange(y_range[0] + dy, y_range[1] + dy, padding=0)
+            
+            # If there is a linked right view box, pan its Y axis too
+            if hasattr(self, "right_view_box") and self.right_view_box is not None:
+                try:
+                    last_view_right = self.right_view_box.mapSceneToView(ev.lastScenePos())
+                    current_view_right = self.right_view_box.mapSceneToView(ev.scenePos())
+                    dy_right = last_view_right.y() - current_view_right.y()
+                    ry_range = self.right_view_box.viewRange()[1]
+                    self.right_view_box.setYRange(ry_range[0] + dy_right, ry_range[1] + dy_right, padding=0)
+                except Exception:
+                    pass
+                    
+        # Left button drag (no Ctrl, no Shift) triggers custom X-axis zoom
+        elif ev.button() == Qt.LeftButton and not (ev.modifiers() & Qt.ShiftModifier):
             ev.accept()
 
             if self.x_zoom_rect is None:
@@ -609,7 +672,13 @@ class XZoomViewBox(pg.ViewBox):
                 self.x_zoom_rect.hide()
 
             if ev.isStart():
+                self.zoom_cancelled = False
                 self.x_zoom_rect.show()
+
+            if self.zoom_cancelled:
+                if ev.isFinish():
+                    self.zoom_cancelled = False
+                return
 
             # Map scene points to local coordinate space of this ViewBox
             start_local = self.mapFromScene(ev.buttonDownScenePos())
@@ -658,11 +727,12 @@ class TdmsBrowserWindow(QMainWindow):
             "#E76F51",
         ]
         self.tabs_state: list[AssignmentTabState] = [
+            AssignmentTabState("surf", [], []),
             AssignmentTabState("Tab 1", [], [])
         ]
-        self.left_axis_series: list[SeriesRef] = self.tabs_state[0].left_axis_series
-        self.right_axis_series: list[SeriesRef] = self.tabs_state[0].right_axis_series
-        self.active_tab_index = 0
+        self.left_axis_series: list[SeriesRef] = self.tabs_state[1].left_axis_series
+        self.right_axis_series: list[SeriesRef] = self.tabs_state[1].right_axis_series
+        self.active_tab_index = 1
         self.is_restoring_state = False
         self.path_remappings = {}
 
@@ -728,6 +798,9 @@ class TdmsBrowserWindow(QMainWindow):
         self.plot_item.vb.sigYRangeChanged.connect(self.sync_right_y_zoom)
         self.right_view_box.sigYRangeChanged.connect(self.on_right_y_range_changed)
 
+        # Reference for custom Ctrl + drag panning
+        self.plot_item.vb.right_view_box = self.right_view_box
+
         # Cursor line addition and interaction
         self.plot_item.addItem(self.v_line, ignoreBounds=True)
         self.plot_item.scene().sigMouseMoved.connect(self.mouse_moved)
@@ -746,7 +819,7 @@ class TdmsBrowserWindow(QMainWindow):
         self.assign_right_button.clicked.connect(self.add_selected_to_right)
         self.remove_selected_button = QPushButton("Remove")
         self.remove_selected_button.clicked.connect(self.remove_selected_from_plot)
-        self.set_batch_filter_button = QPushButton("Set Filter")
+        self.set_batch_filter_button = QPushButton("Channel Options")
         self.set_batch_filter_button.clicked.connect(self.set_filter_for_selected)
         self.clear_plot_button = QPushButton("Clear")
         self.clear_plot_button.clicked.connect(self.clear_assignments)
@@ -785,7 +858,10 @@ class TdmsBrowserWindow(QMainWindow):
             }
             QTabBar::tab:selected {
                 background: palette(window);
-                border-color: palette(mid);
+                border: 1px solid palette(mid);
+                border-bottom: 1px solid palette(window);
+                border-top: 3px solid palette(highlight);
+                font-weight: bold;
                 color: palette(text);
             }
             QTabBar::tab:hover {
@@ -800,19 +876,20 @@ class TdmsBrowserWindow(QMainWindow):
         self.add_tab_button.setToolTip("Add new tab")
         self.add_tab_button.setStyleSheet("""
             QPushButton {
-                border: none;
-                background-color: transparent;
-                font-weight: bold;
-                font-size: 16px;
+                background-color: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 3px;
                 color: palette(button-text);
-                margin-right: 2px;
-                margin-top: 1px;
-                padding: 3px 8px;
+                font-weight: bold;
+                font-size: 14px;
+                margin-right: 4px;
+                margin-top: 2px;
+                margin-bottom: 2px;
+                padding: 2px 8px;
             }
             QPushButton:hover {
                 background-color: palette(light);
                 color: palette(text);
-                border-radius: 3px;
             }
             QPushButton:pressed {
                 background-color: palette(dark);
@@ -821,14 +898,29 @@ class TdmsBrowserWindow(QMainWindow):
         self.add_tab_button.clicked.connect(self.add_assignment_tab)
         self.assignment_tabs.setCornerWidget(self.add_tab_button, Qt.TopRightCorner)
 
-        # Initial Tab Page
+        # Initial Tab Pages
+        surf_page = QWidget()
+        surf_layout = QVBoxLayout(surf_page)
+        surf_layout.setContentsMargins(0, 4, 0, 0)
+        surf_label = QLabel("Surfing Mode: Select channels in the loaded file tree to plot them dynamically.")
+        surf_label.setAlignment(Qt.AlignCenter)
+        surf_label.setStyleSheet("color: palette(mid); font-style: italic; font-size: 12px; margin: 20px;")
+        surf_layout.addWidget(surf_label)
+        surf_layout.addStretch()
+        self.assignment_tabs.addTab(surf_page, "surf")
+
         initial_page = QWidget()
         initial_layout = QVBoxLayout(initial_page)
         initial_layout.setContentsMargins(0, 4, 0, 0)
         initial_layout.addWidget(self.container_widget)
         self.assignment_tabs.addTab(initial_page, "Tab 1")
 
+        # Set default tab index to Tab 1 (1) on startup
+        self.assignment_tabs.setCurrentIndex(1)
+        self._disable_surf_close_button()
+
         # Connect signals
+        self.tree.itemSelectionChanged.connect(self.handle_tree_selection_changed)
         self.assignment_tabs.currentChanged.connect(self.handle_tab_changed)
         self.assignment_tabs.tabCloseRequested.connect(self.handle_tab_close)
         self.assignment_tabs.tabBarDoubleClicked.connect(self.handle_tab_double_clicked)
@@ -989,8 +1081,8 @@ class TdmsBrowserWindow(QMainWindow):
         central_layout.addWidget(self.main_splitter, 1)
         self.setCentralWidget(central_widget)
 
-        # Restore previous session state
-        self.load_state()
+        # Restore previous session state after the window is shown
+        QTimer.singleShot(50, self.load_state)
 
     def _open_native_file_dialog(self) -> Optional[list[str]]:
         """Attempt to open the native OS file picker (zenity/kdialog on Linux)."""
@@ -1256,21 +1348,23 @@ class TdmsBrowserWindow(QMainWindow):
         if source is None:
             return
 
-        dialog = SeriesConfigDialog(ref, [source], self)
+        dialog = ChannelOptionsDialog(ref, [source], self)
         if dialog.exec() == QDialog.Accepted:
-            f_chan_name, f_val = dialog.get_settings()
+            f_chan_name, f_val, local_offset, local_x_offset = dialog.get_settings()
             if f_chan_name is None:
                 ref.filter_channel = None
             else:
                 ref.filter_channel = self._find_group_and_channel_by_name(source, f_chan_name)
             ref.filter_value = f_val
+            ref.offset = local_offset
+            ref.x_offset = local_x_offset
 
             self._refresh_series_list(axis)
             self.update_plot()
             self.save_state()
 
     def set_filter_for_selected(self) -> None:
-        """Set the same filter settings for all selected channels in the axis lists."""
+        """Set the same filter and offset settings for all selected channels in the axis lists."""
         left_sel = self.left_series_list.selectedItems()
         right_sel = self.right_series_list.selectedItems()
 
@@ -1288,7 +1382,7 @@ class TdmsBrowserWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "No Selection",
-                "Please select one or more channels in the axis lists to batch-filter."
+                "Please select one or more channels in the axis lists to configure options."
             )
             return
 
@@ -1298,11 +1392,11 @@ class TdmsBrowserWindow(QMainWindow):
         if not sources:
             return
 
-        # Open SeriesConfigDialog using the first selected channel's settings as template
+        # Open ChannelOptionsDialog using the first selected channel's settings as template
         template_ref = selected_refs[0]
-        dialog = SeriesConfigDialog(template_ref, sources, self)
+        dialog = ChannelOptionsDialog(template_ref, sources, self)
         if dialog.exec() == QDialog.Accepted:
-            f_chan_name, f_val = dialog.get_settings()
+            f_chan_name, f_val, local_offset, local_x_offset = dialog.get_settings()
             for ref in selected_refs:
                 if f_chan_name is None:
                     ref.filter_channel = None
@@ -1313,6 +1407,8 @@ class TdmsBrowserWindow(QMainWindow):
                     else:
                         ref.filter_channel = None
                 ref.filter_value = f_val
+                ref.offset = local_offset
+                ref.x_offset = local_x_offset
 
             self._refresh_series_list("left")
             self._refresh_series_list("right")
@@ -1551,16 +1647,22 @@ class TdmsBrowserWindow(QMainWindow):
 
         self.plotted_data_cache = []
 
+        # Determine which series to plot: dynamic selected items if surf is active, else tab series
+        if self.assignment_tabs.currentIndex() == 0:
+            left_series, right_series = self._get_surf_series_refs()
+        else:
+            left_series, right_series = self.left_axis_series, self.right_axis_series
+
         left_curves = []
         right_curves = []
 
-        for index, ref in enumerate(self.left_axis_series):
+        for index, ref in enumerate(left_series):
             series = self._get_channel_data(ref)
             if series is None:
                 continue
             x_values, y_values = series
             if not getattr(ref, "color", None):
-                ref.color = self._series_color("left", index, len(self.left_axis_series))
+                ref.color = self._series_color("left", index, len(left_series))
             color = ref.color
             curve = self.plot_item.plot(x_values, y_values, pen=pg.mkPen(color, width=2))
             curve.setDownsampling(auto=True, method='peak')
@@ -1583,13 +1685,13 @@ class TdmsBrowserWindow(QMainWindow):
                 "dot_item": dot,
             })
 
-        for index, ref in enumerate(self.right_axis_series):
+        for index, ref in enumerate(right_series):
             series = self._get_channel_data(ref)
             if series is None:
                 continue
             x_values, y_values = series
             if not getattr(ref, "color", None):
-                ref.color = self._series_color("right", index, len(self.left_axis_series))
+                ref.color = self._series_color("right", index, len(left_series))
             color = ref.color
             curve = pg.PlotDataItem(x_values, y_values, pen=pg.mkPen(color, width=2))
             curve.setDownsampling(auto=True, method='peak')
@@ -1706,22 +1808,43 @@ class TdmsBrowserWindow(QMainWindow):
         source = self.loaded_sources.get(series_ref.source_id)
         if source is None:
             return None
-        return get_channel_data(
+        res = get_channel_data(
             source,
             series_ref.group,
             series_ref.channel,
             series_ref.filter_channel,
             series_ref.filter_value,
         )
+        if res is None:
+            return None
+        x, y = res
+        # Apply the channel-specific local Y-axis offset
+        local_offset = getattr(series_ref, "offset", 0.0)
+        if local_offset != 0.0:
+            y = y + local_offset
+        # Apply the channel-specific local X-axis offset
+        local_x_offset = getattr(series_ref, "x_offset", 0.0)
+        if local_x_offset != 0.0:
+            x = x + local_x_offset
+        return x, y
 
     def _series_ref_label(self, series_ref: SeriesRef) -> str:
         """Return a human-friendly label for a plotted series."""
         source = self.loaded_sources.get(series_ref.source_id)
         source_name = source.display_name if source is not None else series_ref.source_id
         base_label = f"{source_name} / {series_ref.group} / {series_ref.channel}"
+        
+        extra_parts = []
+        if getattr(series_ref, "offset", 0.0) != 0.0:
+            extra_parts.append(f"Y-offset: {series_ref.offset:+.6g}")
+        if getattr(series_ref, "x_offset", 0.0) != 0.0:
+            extra_parts.append(f"X-offset: {series_ref.x_offset:+.6g}")
         if series_ref.filter_channel is not None:
             f_group, f_chan = series_ref.filter_channel
-            base_label += f"\n({f_group} / {f_chan} == {series_ref.filter_value:.3g})"
+            extra_parts.append(f"{f_chan} == {series_ref.filter_value:.3g}")
+            
+        if extra_parts:
+            base_label += f"\n({', '.join(extra_parts)})"
         return base_label
 
     def _prune_plot_state(self) -> None:
@@ -1954,10 +2077,16 @@ class TdmsBrowserWindow(QMainWindow):
         except Exception:
             xmin, xmax = None, None
 
+        # Determine which series are active: dynamic selected items if surf is active, else tab series
+        if self.assignment_tabs.currentIndex() == 0:
+            left_series, right_series = self._get_surf_series_refs()
+        else:
+            left_series, right_series = self.left_axis_series, self.right_axis_series
+
         active_channels = {}
-        for ref in self.left_axis_series:
+        for ref in left_series:
             active_channels[(ref.source_id, ref.group, ref.channel)] = ref
-        for ref in self.right_axis_series:
+        for ref in right_series:
             active_channels[(ref.source_id, ref.group, ref.channel)] = ref
 
         self.stats_table.setRowCount(len(self.configured_stats))
@@ -2083,8 +2212,40 @@ class TdmsBrowserWindow(QMainWindow):
             self.stats_table.setItem(idx, 0, lbl_item)
             self.stats_table.setItem(idx, 1, val_item)
 
-    def add_assignment_tab(self) -> None:
+    def _disable_surf_close_button(self) -> None:
+        """Hide the close button on the permanent surf tab (index 0)."""
+        try:
+            self.assignment_tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
+            self.assignment_tabs.tabBar().setTabButton(0, QTabBar.LeftSide, None)
+        except Exception:
+            pass
 
+    def handle_tree_selection_changed(self) -> None:
+        """Update plot if surf tab is active when tree selection changes."""
+        if self.assignment_tabs.currentIndex() == 0:
+            self.update_plot()
+
+    def _get_surf_series_refs(self) -> tuple[list[SeriesRef], list[SeriesRef]]:
+        """Return the list of SeriesRefs currently selected in the tree view for the surf tab."""
+        selected_items = self.tree.selectedItems()
+        left_refs = []
+        
+        idx = 0
+        for item in selected_items:
+            payload = item.data(0, Qt.UserRole)
+            if isinstance(payload, dict) and "source_id" in payload and "group" in payload and "channel" in payload:
+                ref = SeriesRef(
+                    source_id=payload["source_id"],
+                    group=payload["group"],
+                    channel=payload["channel"],
+                    color=self._series_color("left", idx, len(selected_items))
+                )
+                left_refs.append(ref)
+                idx += 1
+                
+        return left_refs, []
+
+    def add_assignment_tab(self) -> None:
         """Create a new assignment tab, inheriting the current tab's settings."""
         curr_idx = self.assignment_tabs.currentIndex()
         if 0 <= curr_idx < len(self.tabs_state):
@@ -2129,11 +2290,14 @@ class TdmsBrowserWindow(QMainWindow):
         self.assignment_tabs.addTab(new_page, new_name)
         # Select the newly created tab (triggers handle_tab_changed)
         self.assignment_tabs.setCurrentIndex(self.assignment_tabs.count() - 1)
+        self._disable_surf_close_button()
 
     def handle_tab_changed(self, index: int) -> None:
         """Handle switching between assignment tabs."""
         if index < 0 or index >= len(self.tabs_state):
             return
+
+        self._disable_surf_close_button()
 
         # 1. Save current viewport state to the tab we are switching AWAY from
         prev_idx = getattr(self, "active_tab_index", 0)
@@ -2146,10 +2310,14 @@ class TdmsBrowserWindow(QMainWindow):
             except Exception:
                 pass
 
-        # 2. Move the container widget to the active tab's layout
-        active_page = self.assignment_tabs.widget(index)
-        if active_page and active_page.layout():
-            active_page.layout().addWidget(self.container_widget)
+        # 2. Move or hide the container widget based on whether we are on the surf tab
+        if index == 0:
+            self.container_widget.hide()
+        else:
+            self.container_widget.show()
+            active_page = self.assignment_tabs.widget(index)
+            if active_page and active_page.layout():
+                active_page.layout().addWidget(self.container_widget)
 
         # 3. Update the active lists references
         state = self.tabs_state[index]
@@ -2178,9 +2346,12 @@ class TdmsBrowserWindow(QMainWindow):
         self.save_state()
 
     def handle_tab_close(self, index: int) -> None:
-        """Close the tab at the given index, preserving at least one tab."""
-        if self.assignment_tabs.count() <= 1:
-            QMessageBox.information(self, "Close Tab", "At least one tab must remain active.")
+        """Close the tab at the given index, preserving at least one tab beside surf."""
+        if index == 0:
+            return # Can't close surf tab
+
+        if self.assignment_tabs.count() <= 2:
+            QMessageBox.information(self, "Close Tab", "At least one regular tab must remain active beside surf.")
             return
 
         confirm = QMessageBox.question(
@@ -2204,11 +2375,15 @@ class TdmsBrowserWindow(QMainWindow):
         # Manually trigger layout shift to the current active tab
         new_active = self.assignment_tabs.currentIndex()
         self.handle_tab_changed(new_active)
+        self._disable_surf_close_button()
 
     def handle_tab_double_clicked(self, index: int) -> None:
         """Rename the double-clicked tab."""
         if index < 0 or index >= len(self.tabs_state):
             return
+
+        if index == 0:
+            return # Can't rename surf tab
 
         current_name = self.tabs_state[index].name
         new_name, ok = QInputDialog.getText(
@@ -2304,7 +2479,9 @@ class TdmsBrowserWindow(QMainWindow):
                     "channel": ref.channel,
                     "color": ref.color,
                     "filter_channel": ref.filter_channel,
-                    "filter_value": ref.filter_value
+                    "filter_value": ref.filter_value,
+                    "offset": getattr(ref, "offset", 0.0),
+                    "x_offset": getattr(ref, "x_offset", 0.0)
                 })
             right_series = []
             for ref in tab.right_axis_series:
@@ -2314,7 +2491,9 @@ class TdmsBrowserWindow(QMainWindow):
                     "channel": ref.channel,
                     "color": ref.color,
                     "filter_channel": ref.filter_channel,
-                    "filter_value": ref.filter_value
+                    "filter_value": ref.filter_value,
+                    "offset": getattr(ref, "offset", 0.0),
+                    "x_offset": getattr(ref, "x_offset", 0.0)
                 })
             tabs_data.append({
                 "name": tab.name,
@@ -2506,60 +2685,83 @@ class TdmsBrowserWindow(QMainWindow):
         """Apply the remaining loaded state configurations (tabs, zoom, stats) after files are reloaded."""
         # 1. Restore tabs state
         tabs_data = state.get("tabs", [])
-        if tabs_data:
-            self.tabs_state.clear()
-            for t_data in tabs_data:
-                left_ref_list = []
-                for ref_data in t_data.get("left_axis_series", []):
-                    ref_sid = ref_data["source_id"]
-                    if ref_sid in self.loaded_sources:
-                        left_ref_list.append(SeriesRef(
-                            source_id=ref_sid,
-                            group=ref_data["group"],
-                            channel=ref_data["channel"],
-                            color=ref_data.get("color"),
-                            filter_channel=ref_data.get("filter_channel"),
-                            filter_value=ref_data.get("filter_value", 0.0)
-                        ))
-                right_ref_list = []
-                for ref_data in t_data.get("right_axis_series", []):
-                    ref_sid = ref_data["source_id"]
-                    if ref_sid in self.loaded_sources:
-                        right_ref_list.append(SeriesRef(
-                            source_id=ref_sid,
-                            group=ref_data["group"],
-                            channel=ref_data["channel"],
-                            color=ref_data.get("color"),
-                            filter_channel=ref_data.get("filter_channel"),
-                            filter_value=ref_data.get("filter_value", 0.0)
-                        ))
-                self.tabs_state.append(AssignmentTabState(
-                    name=t_data["name"],
-                    left_series=left_ref_list,
-                    right_series=right_ref_list
-                ))
-            
-            # Rebuild assignment tabs widgets
-            self.assignment_tabs.currentChanged.disconnect(self.handle_tab_changed)
-            try:
-                self.assignment_tabs.clear()
-                for idx, tab_state in enumerate(self.tabs_state):
-                    tab_page = QWidget()
-                    tab_layout = QVBoxLayout(tab_page)
-                    tab_layout.setContentsMargins(0, 4, 0, 0)
-                    self.assignment_tabs.addTab(tab_page, tab_state.name)
-            finally:
-                self.assignment_tabs.currentChanged.connect(self.handle_tab_changed)
-            
-            # Restore active tab index
-            active_idx = state.get("active_tab_index", 0)
-            if 0 <= active_idx < self.assignment_tabs.count():
-                self.assignment_tabs.setCurrentIndex(active_idx)
-                self.active_tab_index = active_idx
-                self.left_axis_series = self.tabs_state[active_idx].left_axis_series
-                self.right_axis_series = self.tabs_state[active_idx].right_axis_series
-                # Manually trigger layout shift to ensure the container_widget is populated
-                self.handle_tab_changed(active_idx)
+        if not tabs_data:
+            tabs_data = [
+                {"name": "surf", "left_axis_series": [], "right_axis_series": []},
+                {"name": "Tab 1", "left_axis_series": [], "right_axis_series": []}
+            ]
+        elif tabs_data[0].get("name") != "surf":
+            tabs_data.insert(0, {
+                "name": "surf",
+                "left_axis_series": [],
+                "right_axis_series": []
+            })
+
+        self.tabs_state.clear()
+        for t_data in tabs_data:
+            left_ref_list = []
+            for ref_data in t_data.get("left_axis_series", []):
+                ref_sid = ref_data["source_id"]
+                if ref_sid in self.loaded_sources:
+                    left_ref_list.append(SeriesRef(
+                        source_id=ref_sid,
+                        group=ref_data["group"],
+                        channel=ref_data["channel"],
+                        color=ref_data.get("color"),
+                        filter_channel=ref_data.get("filter_channel"),
+                        filter_value=ref_data.get("filter_value", 0.0),
+                        offset=ref_data.get("offset", 0.0),
+                        x_offset=ref_data.get("x_offset", 0.0)
+                    ))
+            right_ref_list = []
+            for ref_data in t_data.get("right_axis_series", []):
+                ref_sid = ref_data["source_id"]
+                if ref_sid in self.loaded_sources:
+                    right_ref_list.append(SeriesRef(
+                        source_id=ref_sid,
+                        group=ref_data["group"],
+                        channel=ref_data["channel"],
+                        color=ref_data.get("color"),
+                        filter_channel=ref_data.get("filter_channel"),
+                        filter_value=ref_data.get("filter_value", 0.0),
+                        offset=ref_data.get("offset", 0.0),
+                        x_offset=ref_data.get("x_offset", 0.0)
+                    ))
+            self.tabs_state.append(AssignmentTabState(
+                name=t_data["name"],
+                left_series=left_ref_list,
+                right_series=right_ref_list
+            ))
+        
+        # Rebuild assignment tabs widgets
+        self.assignment_tabs.currentChanged.disconnect(self.handle_tab_changed)
+        try:
+            self.assignment_tabs.clear()
+            for idx, tab_state in enumerate(self.tabs_state):
+                tab_page = QWidget()
+                tab_layout = QVBoxLayout(tab_page)
+                tab_layout.setContentsMargins(0, 4, 0, 0)
+                if idx == 0:
+                    surf_label = QLabel("Surfing Mode: Select channels in the loaded file tree to plot them dynamically.")
+                    surf_label.setAlignment(Qt.AlignCenter)
+                    surf_label.setStyleSheet("color: palette(mid); font-style: italic; font-size: 12px; margin: 20px;")
+                    tab_layout.addWidget(surf_label)
+                    tab_layout.addStretch()
+                self.assignment_tabs.addTab(tab_page, tab_state.name)
+        finally:
+            self.assignment_tabs.currentChanged.connect(self.handle_tab_changed)
+        
+        self._disable_surf_close_button()
+        
+        # Restore active tab index
+        active_idx = state.get("active_tab_index", 1)
+        if 0 <= active_idx < self.assignment_tabs.count():
+            self.assignment_tabs.setCurrentIndex(active_idx)
+            self.active_tab_index = active_idx
+            self.left_axis_series = self.tabs_state[active_idx].left_axis_series
+            self.right_axis_series = self.tabs_state[active_idx].right_axis_series
+            # Manually trigger layout shift to ensure the container_widget is populated
+            self.handle_tab_changed(active_idx)
                 
         # 2. Restore configured stats
         stats_data = state.get("configured_stats", [])

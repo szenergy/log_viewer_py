@@ -40,6 +40,8 @@ class SeriesRef:
     filter_channel: Optional[tuple[str, str]] = None  # (group_name, channel_name)
     filter_value: float = 0.0
     color: Optional[str] = None
+    offset: float = 0.0
+    x_offset: float = 0.0
 
     def __post_init__(self):
         if not self.series_id:
