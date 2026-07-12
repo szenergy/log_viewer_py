@@ -727,7 +727,7 @@ class TdmsBrowserWindow(QMainWindow):
             "#E76F51",
         ]
         self.tabs_state: list[AssignmentTabState] = [
-            AssignmentTabState("surf", [], []),
+            AssignmentTabState("Surf", [], []),
             AssignmentTabState("Tab 1", [], [])
         ]
         self.left_axis_series: list[SeriesRef] = self.tabs_state[1].left_axis_series
@@ -907,7 +907,7 @@ class TdmsBrowserWindow(QMainWindow):
         surf_label.setStyleSheet("color: palette(mid); font-style: italic; font-size: 12px; margin: 20px;")
         surf_layout.addWidget(surf_label)
         surf_layout.addStretch()
-        self.assignment_tabs.addTab(surf_page, "surf")
+        self.assignment_tabs.addTab(surf_page, "Surf")
 
         initial_page = QWidget()
         initial_layout = QVBoxLayout(initial_page)
@@ -2687,12 +2687,12 @@ class TdmsBrowserWindow(QMainWindow):
         tabs_data = state.get("tabs", [])
         if not tabs_data:
             tabs_data = [
-                {"name": "surf", "left_axis_series": [], "right_axis_series": []},
+                {"name": "Surf", "left_axis_series": [], "right_axis_series": []},
                 {"name": "Tab 1", "left_axis_series": [], "right_axis_series": []}
             ]
-        elif tabs_data[0].get("name") != "surf":
+        elif tabs_data[0].get("name") != "Surf":
             tabs_data.insert(0, {
-                "name": "surf",
+                "name": "Surf",
                 "left_axis_series": [],
                 "right_axis_series": []
             })
